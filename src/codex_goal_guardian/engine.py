@@ -20,10 +20,18 @@ from .state import (
 
 
 _TERMINAL_RECOVERY_ACTIONS = {
+    "thread_resumed_goal_changed",
+    "thread_resumed_stale",
+    "turn_completed",
+}
+_STAGED_RECOVERY_ACTIONS = {
     "thread_resumed",
     "thread_resumed_active",
-    "thread_resumed_goal_changed",
     "turn_started",
+}
+_WAITING_RECOVERY_REASONS = {
+    "thread_active",
+    "turn_in_progress",
 }
 _NETWORK_ERROR_MARKERS = (
     "connection",
@@ -71,17 +79,17 @@ def thread_eligibility(
     if goal_status != "active":
         return False, f"goal_{goal_status}"
 
-    thread_status = _thread_status(thread)
-    if thread_status == "active":
-        return False, "thread_active"
-    if thread_status not in {"idle", "systemError", "notLoaded"}:
-        return False, f"thread_{thread_status or 'missing'}"
-
     updated_at = _timestamp_seconds(thread.get("updatedAt"))
     if updated_at is None:
         return False, "thread_updated_at_missing"
     if now - updated_at > target.max_thread_age_seconds:
         return False, "thread_stale"
+
+    thread_status = _thread_status(thread)
+    if thread_status == "active":
+        return False, "thread_active"
+    if thread_status not in {"idle", "systemError", "notLoaded"}:
+        return False, f"thread_{thread_status or 'missing'}"
 
     turns = thread.get("turns")
     if not isinstance(turns, list) or not turns:
@@ -173,6 +181,16 @@ class RecoveryEngine:
 
                 if transition.recover_now:
                     set_recovery_pending(state, target.name, True)
+                elif (
+                    transition.health == "up"
+                    and target.start_recovery_turn
+                    and _has_staged_recovery(
+                        state,
+                        target.name,
+                        transition.outage_generation,
+                    )
+                ):
+                    set_recovery_pending(state, target.name, True)
                 if not is_recovery_pending(state, target.name):
                     continue
 
@@ -226,12 +244,13 @@ class RecoveryEngine:
                 }
                 for thread_id, record in staged.items():
                     if (
-                        record.get("action") == "thread_resumed"
+                        record.get("action") in _STAGED_RECOVERY_ACTIONS
                         and thread_id not in known_ids
                     ):
                         summaries.append({"id": thread_id})
 
                 had_error = False
+                recovery_waiting = False
                 for summary in summaries:
                     if not isinstance(summary, dict):
                         continue
@@ -246,8 +265,8 @@ class RecoveryEngine:
                     )
                     record_action = record.get("action") if record else None
                     terminal = record_action in _TERMINAL_RECOVERY_ACTIONS
-                    if record_action == "thread_resumed" and target.start_recovery_turn:
-                        terminal = False
+                    if record_action in _STAGED_RECOVERY_ACTIONS:
+                        terminal = not target.start_recovery_turn
 
                     try:
                         thread = client.read_thread(thread_id, include_turns=True)
@@ -260,6 +279,42 @@ class RecoveryEngine:
                             already_recovered=terminal,
                         )
                         if not eligible:
+                            if record_action in _STAGED_RECOVERY_ACTIONS and (
+                                reason.startswith("goal_")
+                                or reason == "thread_stale"
+                            ):
+                                action = (
+                                    "thread_resumed_stale"
+                                    if reason == "thread_stale"
+                                    else "thread_resumed_goal_changed"
+                                )
+                                if not dry_run:
+                                    mark_recovered(
+                                        state,
+                                        target.name,
+                                        outage_generation,
+                                        thread_id,
+                                        action=action,
+                                        turn_id=None,
+                                        now=now,
+                                    )
+                                    store.save(state)
+                                report["actions"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "action": action,
+                                    }
+                                )
+                            elif (
+                                target.start_recovery_turn
+                                and not terminal
+                                and (
+                                    reason in _WAITING_RECOVERY_REASONS
+                                    or record_action
+                                    in _STAGED_RECOVERY_ACTIONS
+                                )
+                            ):
+                                recovery_waiting = True
                             report["skipped"].append(
                                 {"thread_id": thread_id, "reason": reason}
                             )
@@ -282,18 +337,17 @@ class RecoveryEngine:
                             )
                             continue
 
-                        if record_action != "thread_resumed":
-                            client.resume_thread(thread_id)
-                            mark_recovered(
-                                state,
-                                target.name,
-                                outage_generation,
-                                thread_id,
-                                action="thread_resumed",
-                                turn_id=None,
-                                now=now,
-                            )
-                            store.save(state)
+                        client.resume_thread(thread_id)
+                        mark_recovered(
+                            state,
+                            target.name,
+                            outage_generation,
+                            thread_id,
+                            action="thread_resumed",
+                            turn_id=None,
+                            now=now,
+                        )
+                        store.save(state)
 
                         if target.resume_grace_seconds > 0:
                             self._sleep(target.resume_grace_seconds)
@@ -340,9 +394,48 @@ class RecoveryEngine:
                                     "action": "thread_resumed_active",
                                 }
                             )
-                            continue
+                            after_resume, goal_after_resume = (
+                                self._wait_until_settled(
+                                    client,
+                                    thread_id,
+                                    target,
+                                )
+                            )
+                            if (
+                                not isinstance(goal_after_resume, dict)
+                                or goal_after_resume.get("status") != "active"
+                            ):
+                                mark_recovered(
+                                    state,
+                                    target.name,
+                                    outage_generation,
+                                    thread_id,
+                                    action="thread_resumed_goal_changed",
+                                    turn_id=None,
+                                    now=now,
+                                )
+                                store.save(state)
+                                report["actions"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "action": (
+                                            "thread_resumed_goal_changed"
+                                        ),
+                                    }
+                                )
+                                continue
 
                         if not target.start_recovery_turn:
+                            mark_recovered(
+                                state,
+                                target.name,
+                                outage_generation,
+                                thread_id,
+                                action="thread_resumed",
+                                turn_id=None,
+                                now=now,
+                            )
+                            store.save(state)
                             report["actions"].append(
                                 {
                                     "thread_id": thread_id,
@@ -378,6 +471,40 @@ class RecoveryEngine:
                                 "client_user_message_id": message_id,
                             }
                         )
+                        _, goal_after_turn = self._wait_until_settled(
+                            client,
+                            thread_id,
+                            target,
+                        )
+                        final_action = (
+                            "turn_completed"
+                            if (
+                                isinstance(goal_after_turn, dict)
+                                and goal_after_turn.get("status") == "active"
+                            )
+                            else "thread_resumed_goal_changed"
+                        )
+                        mark_recovered(
+                            state,
+                            target.name,
+                            outage_generation,
+                            thread_id,
+                            action=final_action,
+                            turn_id=(
+                                str(turn_id)
+                                if turn_id is not None
+                                else None
+                            ),
+                            now=now,
+                        )
+                        store.save(state)
+                        report["actions"].append(
+                            {
+                                "thread_id": thread_id,
+                                "action": final_action,
+                                "turn_id": turn_id,
+                            }
+                        )
                     except Exception as error:
                         had_error = True
                         report["errors"].append(
@@ -386,7 +513,7 @@ class RecoveryEngine:
                                 "error": _safe_exception(error),
                             }
                         )
-                return not had_error
+                return not had_error and not recovery_waiting
         except Exception as error:
             report["errors"].append(
                 {"thread_id": None, "error": _safe_exception(error)}
@@ -401,12 +528,47 @@ class RecoveryEngine:
             timeout_seconds=15,
         )
 
+    def _wait_until_settled(
+        self,
+        client: Any,
+        thread_id: str,
+        target: TargetConfig,
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+        idle_observations = 0
+        thread: dict[str, Any] = {}
+        goal: Optional[dict[str, Any]] = None
+        while idle_observations < 2:
+            if target.resume_grace_seconds > 0:
+                self._sleep(target.resume_grace_seconds)
+            thread = client.read_thread(thread_id, include_turns=True)
+            goal = client.get_goal(thread_id)
+            if _thread_or_turn_active(thread):
+                idle_observations = 0
+            else:
+                idle_observations += 1
+        return thread, goal
+
 
 def _thread_status(thread: dict[str, Any]) -> str:
     status = thread.get("status")
     if isinstance(status, dict):
         return str(status.get("type", ""))
     return str(status or "")
+
+
+def _has_staged_recovery(
+    state: dict[str, Any],
+    target_name: str,
+    outage_generation: int,
+) -> bool:
+    return any(
+        record.get("action") in _STAGED_RECOVERY_ACTIONS
+        for record in recovery_records(
+            state,
+            target_name,
+            outage_generation,
+        ).values()
+    )
 
 
 def _thread_or_turn_active(thread: dict[str, Any]) -> bool:

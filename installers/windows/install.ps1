@@ -10,7 +10,7 @@ param(
     [string]$TcpHost = "",
     [int]$TcpPort = 0,
     [string]$WslDistro = "Ubuntu-22.04",
-    [string]$WslUser = "roshan",
+    [string]$WslUser = "",
     [ValidateRange(5, 300)]
     [int]$WatchIntervalSeconds = 15
 )
@@ -27,6 +27,10 @@ $RuntimeRoot = Join-Path $InstallRoot "runtime"
 $ConfigPath = Join-Path $InstallRoot "config.json"
 $StatePath = Join-Path $InstallRoot "state.json"
 $LogPath = Join-Path $InstallRoot "guardian.jsonl"
+
+if (-not $SkipWslTask -and [string]::IsNullOrWhiteSpace($WslUser)) {
+    throw "Pass -WslUser with the native Linux user for $WslDistro."
+}
 
 function Write-Plan {
     param([string]$Message)
@@ -48,7 +52,22 @@ function Resolve-NativeCodex {
     return $Application.Source
 }
 
+function Resolve-NativePython {
+    $PyLauncher = Get-Command "py.exe" -CommandType Application `
+        -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $PyLauncher) {
+        $Resolved = (& $PyLauncher.Source -3 -c "import sys; print(sys.executable)" | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Resolved -PathType Leaf)) {
+            return (Resolve-Path -LiteralPath $Resolved).Path
+        }
+    }
+    $Python = Get-Command "python.exe" -CommandType Application `
+        -ErrorAction Stop | Select-Object -First 1
+    return $Python.Source
+}
+
 $CodexPath = Resolve-NativeCodex
+$PythonPath = Resolve-NativePython
 $GuardianCommand = @($CodexPath)
 if ([IO.Path]::GetExtension($CodexPath) -ieq ".cmd") {
     $CodexJs = Join-Path (Split-Path -Parent $CodexPath) "node_modules\@openai\codex\bin\codex.js"
@@ -69,6 +88,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Codex app-server is unavailable: $AppServerOutput"
 }
 Write-Plan "verified $VersionOutput via $GuardianExecutable"
+Write-Plan "verified native Python via $PythonPath"
 
 $ProxyValue = if ($ProxyUrl) { $ProxyUrl } else { $null }
 $TcpHostValue = if ($TcpHost) { $TcpHost } else { $null }
@@ -137,9 +157,10 @@ if ($ForceConfig -or -not (Test-Path -LiteralPath $ConfigPath)) {
 
 if (-not $SkipTasks) {
     $PowerShellPath = (Get-Command "powershell.exe" -ErrorAction Stop).Source
-    $RunnerPath = Join-Path $RuntimeRoot "scripts\run-windows.ps1"
-    $NativeArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$RunnerPath`" watch --config `"$ConfigPath`" --interval $WatchIntervalSeconds --json"
-    $NativeAction = New-ScheduledTaskAction -Execute $PowerShellPath -Argument $NativeArguments
+    $LauncherPath = Join-Path $RuntimeRoot "scripts\guardian-launch.py"
+    $NativeArguments = "`"$LauncherPath`" watch --config `"$ConfigPath`" --interval $WatchIntervalSeconds --json"
+    $NativeAction = New-ScheduledTaskAction -Execute $PythonPath `
+        -Argument $NativeArguments -WorkingDirectory $RuntimeRoot
     $LogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $IntervalTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
         -RepetitionInterval (New-TimeSpan -Minutes 1)
@@ -153,9 +174,11 @@ if (-not $SkipTasks) {
     Write-Plan "registered $TaskWindows"
 
     if (-not $SkipWslTask) {
-        $WslBridgePath = Join-Path $RuntimeRoot "scripts\run-wsl-from-windows.ps1"
-        $WslArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$WslBridgePath`" -Distro `"$WslDistro`" -WslUser `"$WslUser`" -IntervalSeconds $WatchIntervalSeconds"
-        $WslAction = New-ScheduledTaskAction -Execute $PowerShellPath -Argument $WslArguments
+        $WslPath = (Get-Command "wsl.exe" -ErrorAction Stop).Source
+        $WslLauncher = "/home/$WslUser/.local/share/codex-goal-guardian/bin/codex-goal-guardian"
+        $WslConfig = "/home/$WslUser/.config/codex-goal-guardian/config.json"
+        $WslArguments = "-d $WslDistro --user $WslUser --exec $WslLauncher watch --config $WslConfig --interval $WatchIntervalSeconds --json"
+        $WslAction = New-ScheduledTaskAction -Execute $WslPath -Argument $WslArguments
         Register-ScheduledTask -TaskName $TaskWsl -Action $WslAction `
             -Trigger $LogonTrigger -Settings $WatcherSettings `
             -Description "Resume eligible active WSL Codex Goals after network recovery." `

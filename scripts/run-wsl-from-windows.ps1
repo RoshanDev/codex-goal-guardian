@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Distro = "Ubuntu-22.04",
-    [string]$WslUser = "roshan",
+    [Parameter(Mandatory = $true)]
+    [string]$WslUser,
     [ValidateRange(5, 300)]
     [int]$IntervalSeconds = 15
 )

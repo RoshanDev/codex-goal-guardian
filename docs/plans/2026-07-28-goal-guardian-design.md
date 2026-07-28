@@ -48,14 +48,15 @@ as an optional CLI-only fallback.
 - probes configured network endpoints and optional local proxy ports;
 - persists health state and increments an outage generation on a healthy to
   unhealthy transition;
-- starts one App Server subprocess per configured runtime target;
+- starts one App Server subprocess per recovering runtime target and keeps that
+  connection attached while a resumed or recovery turn remains active;
 - initializes the JSON-RPC connection and feature-probes required methods;
 - lists recent threads, reads Goals, and inspects the final turn;
 - selects only active Goal + idle/system-error/not-loaded threads;
 - rejects active turns, paused/blocked/limited/completed Goals, stale threads,
   and already-recovered outage/thread pairs;
-- resumes the thread, then starts an idempotent reconciliation turn only when
-  configured and when thread resume alone did not make it active.
+- resumes the thread, waits on the same connection if resume makes it active,
+  then starts and follows an idempotent reconciliation turn only when needed.
 
 ### Runtime targets
 
@@ -70,7 +71,8 @@ PATH, which currently resolves a Windows shim under Node 12.
 
 - Windows PowerShell installer copies a self-contained runtime to
   `%LOCALAPPDATA%\CodexGoalGuardian`, writes a local JSON configuration, and
-  creates Task Scheduler entries.
+  creates Task Scheduler entries that supervise native Python and `wsl.exe`
+  directly so task restarts do not orphan child watchers.
 - WSL installer copies the same Python package to
   `~/.local/share/codex-goal-guardian` and can install a systemd user timer.
 - Uninstallers remove only Guardian-owned tasks, units, and installed files.
@@ -93,9 +95,12 @@ The plugin contributes:
 4. For each eligible thread, acquire an atomic per-target lock.
 5. Re-read thread and Goal to close the race with a user or another client.
 6. Call `thread/resume`.
-7. If configured, call `turn/start` with a deterministic recovery prompt and
-   `clientUserMessageId` derived from target, outage generation, and thread ID.
-8. Persist the successful action before releasing the lock.
+7. If resume makes the thread active, keep that App Server connection open
+   until the turn settles.
+8. If configured and the Goal remains active, call `turn/start` with a
+   deterministic recovery prompt and `clientUserMessageId` derived from target,
+   outage generation, and thread ID, then stay attached until completion.
+9. Persist the successful action before releasing the lock.
 
 ## Failure behavior
 

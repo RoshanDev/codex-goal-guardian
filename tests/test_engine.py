@@ -20,6 +20,9 @@ from codex_goal_guardian.health import HealthResult
 from codex_goal_guardian.state import (
     StateStore,
     default_state,
+    is_recovery_pending,
+    mark_recovered,
+    recovery_record,
     transition_health,
     was_recovered,
 )
@@ -135,11 +138,20 @@ class EligibilityTests(unittest.TestCase):
 
 
 class _FakeClient:
-    def __init__(self, *, fail_start: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_start: bool = False,
+        read_sequence: list[dict] | None = None,
+        listed_thread: dict | None = None,
+    ) -> None:
         self.fail_start = fail_start
+        self.read_sequence = list(read_sequence or [])
+        self.listed_thread = listed_thread or make_thread()
         self.resume_calls = 0
         self.start_calls = 0
         self.read_calls = 0
+        self.list_calls = 0
 
     def __enter__(self) -> "_FakeClient":
         return self
@@ -148,13 +160,16 @@ class _FakeClient:
         return None
 
     def list_threads(self, *, limit: int) -> list[dict]:
-        return [make_thread()]
+        self.list_calls += 1
+        return [self.listed_thread]
 
     def get_goal(self, thread_id: str) -> dict:
         return {"threadId": thread_id, "status": "active"}
 
     def read_thread(self, thread_id: str, *, include_turns: bool) -> dict:
         self.read_calls += 1
+        if self.read_sequence:
+            return self.read_sequence.pop(0)
         return make_thread()
 
     def resume_thread(self, thread_id: str) -> dict:
@@ -223,7 +238,7 @@ class RecoveryEngineTests(unittest.TestCase):
         state = self.store.load()
         self.assertTrue(was_recovered(state, "wsl", 1, "thread-1"))
 
-    def test_failed_turn_start_retries_without_repeating_resume(self) -> None:
+    def test_failed_turn_start_retries_after_fresh_resume(self) -> None:
         first_client = _FakeClient(fail_start=True)
         second_client = _FakeClient()
         clients = iter((first_client, second_client))
@@ -239,10 +254,134 @@ class RecoveryEngineTests(unittest.TestCase):
 
         self.assertEqual(first_client.resume_calls, 1)
         self.assertEqual(first_client.start_calls, 1)
-        self.assertEqual(second_client.resume_calls, 0)
+        self.assertEqual(second_client.resume_calls, 1)
         self.assertEqual(second_client.start_calls, 1)
         self.assertTrue(first["targets"][0]["errors"])
         self.assertEqual(second["targets"][0]["actions"][0]["action"], "turn_started")
+
+    def test_active_turn_after_resume_stays_attached_until_idle(self) -> None:
+        client = _FakeClient(
+            read_sequence=[
+                make_thread(),
+                make_thread(
+                    thread_status="active",
+                    turn_status="inProgress",
+                ),
+                make_thread(turn_status="completed"),
+                make_thread(turn_status="completed"),
+            ]
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(self.config)
+        state = self.store.load()
+
+        self.assertEqual(report["targets"][0]["status"], "recovered")
+        self.assertEqual(
+            report["targets"][0]["actions"][0]["action"],
+            "thread_resumed_active",
+        )
+        self.assertFalse(is_recovery_pending(state, "wsl"))
+        self.assertEqual(
+            recovery_record(
+                state,
+                "wsl",
+                1,
+                "thread-1",
+            )["action"],
+            "turn_completed",
+        )
+        self.assertEqual(client.resume_calls, 1)
+        self.assertEqual(client.start_calls, 1)
+        self.assertEqual(
+            report["targets"][0]["actions"][1]["action"],
+            "turn_started",
+        )
+        self.assertEqual(
+            report["targets"][0]["actions"][2]["action"],
+            "turn_completed",
+        )
+
+    def test_initial_active_turn_stays_pending_until_idle(self) -> None:
+        active = make_thread(
+            thread_status="active",
+            turn_status="inProgress",
+        )
+        first_client = _FakeClient(
+            listed_thread=active,
+            read_sequence=[active],
+        )
+        second_client = _FakeClient(
+            read_sequence=[
+                make_thread(turn_status="completed"),
+                make_thread(turn_status="completed"),
+            ]
+        )
+        clients = iter((first_client, second_client))
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: next(clients),
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        first = engine.run_once(self.config)
+        second = engine.run_once(self.config)
+
+        self.assertEqual(first["targets"][0]["status"], "recovery_pending")
+        self.assertEqual(
+            first["targets"][0]["skipped"][0]["reason"],
+            "thread_active",
+        )
+        self.assertEqual(first_client.resume_calls, 0)
+        self.assertEqual(first_client.start_calls, 0)
+        self.assertEqual(second_client.resume_calls, 1)
+        self.assertEqual(second_client.start_calls, 1)
+        self.assertEqual(
+            second["targets"][0]["actions"][0]["action"],
+            "turn_started",
+        )
+
+    def test_legacy_active_record_is_rearmed_after_upgrade(self) -> None:
+        state = self.store.load()
+        transition_health(state, "wsl", True, 2, now=115)
+        mark_recovered(
+            state,
+            "wsl",
+            1,
+            "thread-1",
+            action="thread_resumed_active",
+            turn_id=None,
+            now=115,
+        )
+        self.store.save(state)
+        client = _FakeClient(
+            read_sequence=[
+                make_thread(turn_status="interrupted"),
+                make_thread(turn_status="interrupted"),
+            ]
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(self.config)
+
+        self.assertEqual(report["targets"][0]["status"], "recovered")
+        self.assertEqual(client.resume_calls, 1)
+        self.assertEqual(client.start_calls, 1)
+        self.assertEqual(
+            report["targets"][0]["actions"][0]["action"],
+            "turn_started",
+        )
 
     def test_dry_run_reports_candidate_without_mutating_thread(self) -> None:
         client = _FakeClient()

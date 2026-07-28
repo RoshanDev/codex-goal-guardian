@@ -18,6 +18,10 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("[switch]$DryRun", content)
         self.assertIn("Register-ScheduledTask", content)
         self.assertIn("watch --config", content)
+        self.assertIn("guardian-launch.py", content)
+        self.assertIn("Resolve-NativePython", content)
+        self.assertIn('New-ScheduledTaskAction -Execute $PythonPath', content)
+        self.assertIn('New-ScheduledTaskAction -Execute $WslPath', content)
         self.assertIn("[TimeSpan]::Zero", content)
         self.assertNotIn("WindowsApps", content)
         self.assertNotIn(".vscode", content.lower())
@@ -60,6 +64,7 @@ class InstallerInvariantTests(unittest.TestCase):
                 "scripts/run-wsl.sh",
                 "scripts/run-wsl-from-windows.ps1",
                 "scripts/watchdog-windows.ps1",
+                "scripts/guardian-launch.py",
             )
         )
 

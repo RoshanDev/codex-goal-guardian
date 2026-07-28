@@ -39,8 +39,13 @@ with:
 
 Immediately before mutation it reads the thread and Goal again. It calls
 `thread/resume`, waits briefly, and starts a deterministic reconciliation turn
-only if the thread is still idle. Successful stages are persisted atomically,
-so a retry can finish `turn/start` without repeating `thread/resume`.
+only if the thread is still idle. If the server-side turn remains active, the
+same App Server connection stays open and is checked until that turn settles;
+closing the connection early would interrupt the resumed turn. Successful
+stages are persisted atomically. Each fresh App Server process reopens the
+thread with `thread/resume` before `turn/start`, and the recovery turn remains
+attached until completion. It uses a deterministic client message ID so retries
+remain idempotent.
 
 The reconciliation prompt tells Codex to inspect recorded terminal state and
 avoid repeating successful commands or mutations.
@@ -74,12 +79,13 @@ From Windows PowerShell, install the native runtime and both self-restarting
 scheduled watchers:
 
 ```powershell
+$WslUser = "replace-with-your-wsl-user"
 & "\\wsl.localhost\Ubuntu-22.04\home\$WslUser\Developer\codex-goal-guardian\installers\windows\install.ps1" `
   -ProxyUrl "http://127.0.0.1:7890" `
   -TcpHost "127.0.0.1" `
   -TcpPort 7890 `
   -WslDistro "Ubuntu-22.04" `
-  -WslUser "roshan" `
+  -WslUser $WslUser `
   -WatchIntervalSeconds 15
 ```
 
@@ -152,6 +158,10 @@ and logs should also be deleted.
 
 ## Limitations
 
+- Codex can still display its built-in `reconnecting /5` sequence. Guardian
+  does not replace or reattach that UI transport stream; after the stream is
+  exhausted, it resumes the persisted thread and starts a new reconciliation
+  turn when doing so is safe.
 - Guardian cannot continue work that is waiting for user input or approval.
 - An incompatible future App Server schema fails closed; it never falls back
   to direct database edits or UI automation.
