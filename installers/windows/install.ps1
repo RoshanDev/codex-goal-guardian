@@ -68,6 +68,11 @@ function Resolve-NativePython {
 
 $CodexPath = Resolve-NativeCodex
 $PythonPath = Resolve-NativePython
+$PythonwPath = Join-Path (Split-Path -Parent $PythonPath) "pythonw.exe"
+if (-not (Test-Path -LiteralPath $PythonwPath -PathType Leaf)) {
+    throw "Native pythonw.exe was not found beside $PythonPath."
+}
+$PythonwPath = (Resolve-Path -LiteralPath $PythonwPath).Path
 $GuardianCommand = @($CodexPath)
 if ([IO.Path]::GetExtension($CodexPath) -ieq ".cmd") {
     $CodexJs = Join-Path (Split-Path -Parent $CodexPath) "node_modules\@openai\codex\bin\codex.js"
@@ -89,6 +94,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Plan "verified $VersionOutput via $GuardianExecutable"
 Write-Plan "verified native Python via $PythonPath"
+Write-Plan "verified windowless Python via $PythonwPath"
 
 $ProxyValue = if ($ProxyUrl) { $ProxyUrl } else { $null }
 $TcpHostValue = if ($TcpHost) { $TcpHost } else { $null }
@@ -159,7 +165,7 @@ if (-not $SkipTasks) {
     $PowerShellPath = (Get-Command "powershell.exe" -ErrorAction Stop).Source
     $LauncherPath = Join-Path $RuntimeRoot "scripts\guardian-launch.py"
     $NativeArguments = "`"$LauncherPath`" watch --config `"$ConfigPath`" --interval $WatchIntervalSeconds --json"
-    $NativeAction = New-ScheduledTaskAction -Execute $PythonPath `
+    $NativeAction = New-ScheduledTaskAction -Execute $PythonwPath `
         -Argument $NativeArguments -WorkingDirectory $RuntimeRoot
     $LogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $IntervalTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
@@ -177,8 +183,9 @@ if (-not $SkipTasks) {
         $WslPath = (Get-Command "wsl.exe" -ErrorAction Stop).Source
         $WslLauncher = "/home/$WslUser/.local/share/codex-goal-guardian/bin/codex-goal-guardian"
         $WslConfig = "/home/$WslUser/.config/codex-goal-guardian/config.json"
-        $WslArguments = "-d $WslDistro --user $WslUser --exec $WslLauncher watch --config $WslConfig --interval $WatchIntervalSeconds --json"
-        $WslAction = New-ScheduledTaskAction -Execute $WslPath -Argument $WslArguments
+        $WslArguments = "`"$LauncherPath`" --windows-hidden-child `"$WslPath`" -d $WslDistro --user $WslUser --exec $WslLauncher watch --config $WslConfig --interval $WatchIntervalSeconds --json"
+        $WslAction = New-ScheduledTaskAction -Execute $PythonwPath `
+            -Argument $WslArguments -WorkingDirectory $RuntimeRoot
         Register-ScheduledTask -TaskName $TaskWsl -Action $WslAction `
             -Trigger $LogonTrigger -Settings $WatcherSettings `
             -Description "Resume eligible active WSL Codex Goals after network recovery." `
@@ -191,7 +198,9 @@ if (-not $SkipTasks) {
     if ($SkipWslTask) {
         $WatchdogArguments += " -SkipWsl"
     }
-    $WatchdogAction = New-ScheduledTaskAction -Execute $PowerShellPath -Argument $WatchdogArguments
+    $HiddenWatchdogArguments = "`"$LauncherPath`" --windows-hidden-child `"$PowerShellPath`" $WatchdogArguments"
+    $WatchdogAction = New-ScheduledTaskAction -Execute $PythonwPath `
+        -Argument $HiddenWatchdogArguments -WorkingDirectory $RuntimeRoot
     $WatchdogSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 1)

@@ -16,7 +16,10 @@ The Windows app package, `app.asar`, private UI bridges, and versioned editor
 extensions are outside the trust boundary. Windows Task Scheduler launches
 15-second native Windows and WSL watchers; an optional WSL user timer is a
 fallback. A one-minute watchdog restarts either watcher if it exits. All three
-tasks use a standalone Python runtime copied to:
+Windows tasks enter through `pythonw.exe`; WSL and PowerShell children use the
+Windows `CREATE_NO_WINDOW` flag, so scheduled monitoring does not leave visible
+console windows. Native Codex App Server recovery children use the same flag.
+The standalone runtime is copied to:
 
 - Windows: `%LOCALAPPDATA%\CodexGoalGuardian`
 - WSL2: `~/.local/share/codex-goal-guardian`

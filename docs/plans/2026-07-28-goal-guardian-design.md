@@ -71,8 +71,11 @@ PATH, which currently resolves a Windows shim under Node 12.
 
 - Windows PowerShell installer copies a self-contained runtime to
   `%LOCALAPPDATA%\CodexGoalGuardian`, writes a local JSON configuration, and
-  creates Task Scheduler entries that supervise native Python and `wsl.exe`
-  directly so task restarts do not orphan child watchers.
+  creates Task Scheduler entries that enter through `pythonw.exe`. Native
+  monitoring runs in that task-owned process; the WSL watcher stays attached
+  as a synchronous child created with `CREATE_NO_WINDOW`, so task restarts
+  still control the watcher process tree without visible console windows.
+  Native Codex App Server children use the same creation flag.
 - WSL installer copies the same Python package to
   `~/.local/share/codex-goal-guardian` and can install a systemd user timer.
 - Uninstallers remove only Guardian-owned tasks, units, and installed files.

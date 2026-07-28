@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from codex_goal_guardian.app_server import AppServerClient, AppServerError
+from codex_goal_guardian.app_server import (
+    AppServerClient,
+    AppServerError,
+    _app_server_creation_flags,
+)
 
 
 class AppServerClientTests(unittest.TestCase):
@@ -76,6 +80,10 @@ class AppServerClientTests(unittest.TestCase):
                 self.client.request("missing/method", {})
 
         self.assertIn("missing/method", str(context.exception))
+
+    def test_windows_app_server_uses_create_no_window(self) -> None:
+        self.assertEqual(_app_server_creation_flags("nt"), 0x08000000)
+        self.assertEqual(_app_server_creation_flags("posix"), 0)
 
 
 if __name__ == "__main__":

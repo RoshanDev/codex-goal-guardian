@@ -20,8 +20,17 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("watch --config", content)
         self.assertIn("guardian-launch.py", content)
         self.assertIn("Resolve-NativePython", content)
-        self.assertIn('New-ScheduledTaskAction -Execute $PythonPath', content)
-        self.assertIn('New-ScheduledTaskAction -Execute $WslPath', content)
+        self.assertIn("pythonw.exe", content)
+        self.assertEqual(
+            content.count("New-ScheduledTaskAction -Execute $PythonwPath"),
+            3,
+        )
+        self.assertGreaterEqual(content.count("--windows-hidden-child"), 2)
+        self.assertNotIn('New-ScheduledTaskAction -Execute $WslPath', content)
+        self.assertNotIn(
+            'New-ScheduledTaskAction -Execute $PowerShellPath',
+            content,
+        )
         self.assertIn("[TimeSpan]::Zero", content)
         self.assertNotIn("WindowsApps", content)
         self.assertNotIn(".vscode", content.lower())
@@ -70,6 +79,7 @@ class InstallerInvariantTests(unittest.TestCase):
 
         self.assertIn("PYTHONPATH", content)
         self.assertIn("sys.executable", content)
+        self.assertIn("CREATE_NO_WINDOW", content)
         self.assertNotIn("WindowsApps", content)
         self.assertNotIn("resources/app", content)
 

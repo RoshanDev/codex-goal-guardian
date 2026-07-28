@@ -13,6 +13,14 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 from . import __version__
 
 
+CREATE_NO_WINDOW = 0x08000000
+
+
+def _app_server_creation_flags(platform_name: str | None = None) -> int:
+    current_platform = os.name if platform_name is None else platform_name
+    return CREATE_NO_WINDOW if current_platform == "nt" else 0
+
+
 class AppServerError(RuntimeError):
     """Raised when the Codex app-server cannot complete a request."""
 
@@ -80,6 +88,7 @@ class AppServerClient:
                 errors="replace",
                 bufsize=1,
                 env=environment,
+                creationflags=_app_server_creation_flags(),
             )
         except OSError as error:
             raise AppServerError(
