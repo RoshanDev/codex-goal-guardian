@@ -200,6 +200,22 @@ Pull a new repository revision and rerun the installers. Runtime files and
 owned scheduler definitions are refreshed; local configuration and state are
 preserved by default.
 
+The Windows installer checks both native Windows and WSL recovery processes
+before it stops any Guardian-owned task. The default
+`-DrainTimeoutMinutes 0` fails closed when a recovery is active. For an
+unattended rolling update, let it wait for the active recovery to finish
+naturally:
+
+```powershell
+.\installers\windows\install.ps1 `
+  -WslDistro Ubuntu-22.04 `
+  -WslUser "your-wsl-user" `
+  -DrainTimeoutMinutes 720
+```
+
+The installer requires two consecutive clear observations before changing the
+runtime or scheduler. A timeout also exits without stopping any task.
+
 Uninstallers remove only Guardian-owned tasks, units, and runtime files:
 
 ```powershell

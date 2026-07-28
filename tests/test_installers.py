@@ -21,6 +21,17 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("guardian-launch.py", content)
         self.assertIn("Resolve-NativePython", content)
         self.assertIn("pythonw.exe", content)
+        self.assertIn("[int]$DrainTimeoutMinutes", content)
+        self.assertIn("Wait-GuardianRecoveryDrain", content)
+        self.assertIn("Get-CimInstance Win32_Process", content)
+        self.assertIn("/proc/[0-9]*/cmdline", content)
+        self.assertIn("Select-Object -First 1", content)
+        self.assertIn("$ClearObservations -ge 2", content)
+        self.assertIn("No tasks were stopped", content)
+        self.assertLess(
+            content.rindex("Wait-GuardianRecoveryDrain"),
+            content.index("Stop-ScheduledTask"),
+        )
         self.assertEqual(
             content.count("New-ScheduledTaskAction -Execute $PythonwPath"),
             3,

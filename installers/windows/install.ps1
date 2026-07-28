@@ -12,7 +12,9 @@ param(
     [string]$WslDistro = "Ubuntu-22.04",
     [string]$WslUser = "",
     [ValidateRange(5, 300)]
-    [int]$WatchIntervalSeconds = 15
+    [int]$WatchIntervalSeconds = 15,
+    [ValidateRange(0, 1440)]
+    [int]$DrainTimeoutMinutes = 0
 )
 
 Set-StrictMode -Version Latest
@@ -64,6 +66,124 @@ function Resolve-NativePython {
     $Python = Get-Command "python.exe" -CommandType Application `
         -ErrorAction Stop | Select-Object -First 1
     return $Python.Source
+}
+
+function Test-WindowsRecoveryProcess {
+    param([string[]]$Command)
+
+    foreach ($Process in @(Get-CimInstance Win32_Process)) {
+        if ($Process.ProcessId -eq $PID -or
+            [string]::IsNullOrWhiteSpace($Process.CommandLine)) {
+            continue
+        }
+        if ($Process.CommandLine.IndexOf(
+                "app-server",
+                [StringComparison]::OrdinalIgnoreCase
+            ) -lt 0) {
+            continue
+        }
+
+        $MatchesCommand = $true
+        foreach ($CommandPart in $Command) {
+            if ($Process.CommandLine.IndexOf(
+                    $CommandPart,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -lt 0) {
+                $MatchesCommand = $false
+                break
+            }
+        }
+        if ($MatchesCommand) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-WslRecoveryProcess {
+    param(
+        [string]$Distro,
+        [string]$LinuxUser
+    )
+
+    $Wsl = Get-Command "wsl.exe" -CommandType Application `
+        -ErrorAction Stop | Select-Object -First 1
+    $Probe = @'
+current=$$
+for path in /proc/[0-9]*/cmdline; do
+    pid=${path#/proc/}
+    pid=${pid%/cmdline}
+    [ "$pid" = "$current" ] && continue
+    [ -r "$path" ] || continue
+    line=$(tr '\000' ' ' < "$path" 2>/dev/null)
+    case "$line" in
+        *codex*app-server*) exit 0 ;;
+    esac
+done
+exit 1
+'@
+
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $null = & $Wsl.Source -d $Distro --user $LinuxUser `
+            --exec sh -c $Probe 2>$null
+        $ProbeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+    if ($ProbeExitCode -eq 0) {
+        return $true
+    }
+    if ($ProbeExitCode -eq 1) {
+        return $false
+    }
+    throw "Unable to inspect active Codex recovery processes in $Distro (exit $ProbeExitCode)."
+}
+
+function Wait-GuardianRecoveryDrain {
+    param(
+        [string[]]$WindowsCommand,
+        [string]$Distro,
+        [string]$LinuxUser,
+        [switch]$SkipWsl,
+        [int]$TimeoutMinutes
+    )
+
+    $Deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $ClearObservations = 0
+    $WaitingAnnounced = $false
+
+    while ($true) {
+        $WindowsActive = Test-WindowsRecoveryProcess -Command $WindowsCommand
+        $WslActive = $false
+        if (-not $SkipWsl) {
+            $WslActive = Test-WslRecoveryProcess `
+                -Distro $Distro -LinuxUser $LinuxUser
+        }
+
+        if (-not $WindowsActive -and -not $WslActive) {
+            $ClearObservations += 1
+            if ($ClearObservations -ge 2) {
+                Write-Plan "recovery processes are drained; installation may continue"
+                return
+            }
+        } else {
+            $ClearObservations = 0
+            if (-not $WaitingAnnounced) {
+                Write-Plan "active recovery detected; waiting for it to finish naturally"
+                $WaitingAnnounced = $true
+            }
+            if ($TimeoutMinutes -eq 0) {
+                throw "Active Codex recovery detected. No tasks were stopped. Re-run with -DrainTimeoutMinutes <minutes> to wait for a safe update window."
+            }
+        }
+
+        if ($TimeoutMinutes -gt 0 -and (Get-Date) -ge $Deadline) {
+            throw "Timed out waiting for active Codex recovery processes. No tasks were stopped."
+        }
+        Start-Sleep -Seconds 1
+    }
 }
 
 $CodexPath = Resolve-NativeCodex
@@ -138,6 +258,10 @@ if ($DryRun) {
     }
     exit 0
 }
+
+Wait-GuardianRecoveryDrain -WindowsCommand $GuardianCommand `
+    -Distro $WslDistro -LinuxUser $WslUser `
+    -SkipWsl:$SkipWslTask -TimeoutMinutes $DrainTimeoutMinutes
 
 foreach ($OwnedTask in @($TaskWatchdog, $TaskWindows, $TaskWsl)) {
     $ExistingTask = Get-ScheduledTask -TaskName $OwnedTask -ErrorAction SilentlyContinue
