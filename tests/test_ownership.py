@@ -58,6 +58,34 @@ class OwnershipProbeTests(unittest.TestCase):
             )
         )
 
+    def test_bare_codex_command_requires_an_executable_token(self) -> None:
+        command = ("codex",)
+
+        self.assertTrue(
+            _command_line_matches(
+                '"C:/Users/test/AppData/Roaming/npm/codex.cmd" exec',
+                command,
+            )
+        )
+        self.assertTrue(
+            _command_line_matches(
+                '"C:/tools/codex.exe" app-server',
+                command,
+            )
+        )
+        self.assertFalse(
+            _command_line_matches(
+                'python.exe C:/workspace/codex-goal-guardian/lab.py',
+                command,
+            )
+        )
+        self.assertFalse(
+            _command_line_matches(
+                'node.exe C:/tools/codex.js app-server',
+                command,
+            )
+        )
+
     def test_live_configured_process_is_detected(self) -> None:
         script = ROOT / "tests/fixtures/fake_app_server.py"
         process = subprocess.Popen(

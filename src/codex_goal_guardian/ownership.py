@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -104,7 +105,22 @@ def _command_line_matches(line: str, command: Sequence[str]) -> bool:
     expected = [
         _normalize_token(item) for item in _command_signature(command)
     ]
-    return bool(expected) and all(item in normalized_line for item in expected)
+    return bool(expected) and all(
+        _command_line_contains(normalized_line, item) for item in expected
+    )
+
+
+def _command_line_contains(line: str, expected: str) -> bool:
+    if "/" in expected:
+        return expected in line
+    executable_suffix = ""
+    if not expected.endswith((".exe", ".cmd", ".bat")):
+        executable_suffix = r"(?:\.(?:exe|cmd|bat))?"
+    pattern = (
+        rf"(?<![a-z0-9_.-]){re.escape(expected)}"
+        rf"{executable_suffix}(?![a-z0-9_.-])"
+    )
+    return re.search(pattern, line) is not None
 
 
 def _command_signature(command: Sequence[str]) -> tuple[str, ...]:

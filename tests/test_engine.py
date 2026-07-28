@@ -251,6 +251,7 @@ class RecoveryEngineTests(unittest.TestCase):
         engine = RecoveryEngine(
             probe=self.healthy,
             client_factory=lambda _: client,
+            process_probe=lambda _: False,
             now=lambda: 120,
             sleep=lambda _: None,
         )
@@ -272,6 +273,7 @@ class RecoveryEngineTests(unittest.TestCase):
         engine = RecoveryEngine(
             probe=self.healthy,
             client_factory=lambda _: next(clients),
+            process_probe=lambda _: False,
             now=lambda: 120,
             sleep=lambda _: None,
         )
@@ -301,6 +303,7 @@ class RecoveryEngineTests(unittest.TestCase):
         engine = RecoveryEngine(
             probe=self.healthy,
             client_factory=lambda _: client,
+            process_probe=lambda _: False,
             now=lambda: 120,
             sleep=lambda _: None,
         )
@@ -351,6 +354,7 @@ class RecoveryEngineTests(unittest.TestCase):
         engine = RecoveryEngine(
             probe=self.healthy,
             client_factory=lambda _: next(clients),
+            process_probe=lambda _: False,
             now=lambda: 120,
             sleep=lambda _: None,
         )
@@ -394,6 +398,7 @@ class RecoveryEngineTests(unittest.TestCase):
         engine = RecoveryEngine(
             probe=self.healthy,
             client_factory=lambda _: client,
+            process_probe=lambda _: False,
             now=lambda: 120,
             sleep=lambda _: None,
         )
@@ -428,6 +433,7 @@ class RecoveryEngineTests(unittest.TestCase):
         engine = RecoveryEngine(
             probe=self.healthy,
             client_factory=lambda _: client,
+            process_probe=lambda _: False,
             now=lambda: 120,
             sleep=lambda _: None,
         )
@@ -476,6 +482,7 @@ class RecoveryEngineTests(unittest.TestCase):
         engine = RecoveryEngine(
             probe=self.healthy,
             client_factory=lambda _: client,
+            process_probe=lambda _: False,
             now=lambda: 120,
             sleep=lambda _: None,
         )
@@ -493,6 +500,7 @@ class RecoveryEngineTests(unittest.TestCase):
         engine = RecoveryEngine(
             probe=self.healthy,
             client_factory=lambda _: self.fail("client should not start"),
+            process_probe=lambda _: False,
             now=lambda: 130,
             sleep=lambda _: None,
         )
