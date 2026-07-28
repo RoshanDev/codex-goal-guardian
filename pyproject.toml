@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-goal-guardian"
+version = "0.1.0"
+description = "Update-resilient network recovery for active Codex Goals"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "RoshanDev"}]
+dependencies = []
+
+[project.scripts]
+codex-goal-guardian = "codex_goal_guardian.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

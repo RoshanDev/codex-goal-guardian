@@ -1,0 +1,263 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator, MutableMapping
+
+
+SCHEMA_VERSION = 1
+
+
+class StateCorruptionError(RuntimeError):
+    """Raised when persisted Guardian state cannot be trusted."""
+
+
+@dataclass(frozen=True)
+class HealthTransition:
+    recover_now: bool
+    outage_generation: int
+    outage_started_at: int | None
+    health: str
+    consecutive_healthy: int
+    consecutive_unhealthy: int
+
+
+def default_state() -> dict[str, Any]:
+    return {"schema_version": SCHEMA_VERSION, "targets": {}}
+
+
+def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str, Any]:
+    targets = state.setdefault("targets", {})
+    target = targets.setdefault(
+        target_name,
+        {
+            "health": "unknown",
+            "consecutive_healthy": 0,
+            "consecutive_unhealthy": 0,
+            "unhealthy_started_at": None,
+            "outage_generation": 0,
+            "outage_started_at": None,
+            "recovery_pending": False,
+            "recovered": {},
+        },
+    )
+    target.setdefault("health", "unknown")
+    target.setdefault("consecutive_healthy", 0)
+    target.setdefault("consecutive_unhealthy", 0)
+    target.setdefault("unhealthy_started_at", None)
+    target.setdefault("outage_generation", 0)
+    target.setdefault("outage_started_at", None)
+    target.setdefault("recovery_pending", False)
+    target.setdefault("recovered", {})
+    return target
+
+
+def transition_health(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    healthy: bool,
+    required_successes: int,
+    *,
+    required_failures: int = 2,
+    now: int | None = None,
+) -> HealthTransition:
+    if required_successes < 1:
+        raise ValueError("required_successes must be at least 1")
+    if required_failures < 1:
+        raise ValueError("required_failures must be at least 1")
+
+    timestamp = int(time.time() if now is None else now)
+    target = _target_state(state, target_name)
+    recover_now = False
+
+    if not healthy:
+        target["consecutive_unhealthy"] = (
+            int(target["consecutive_unhealthy"]) + 1
+        )
+        if target["consecutive_unhealthy"] == 1:
+            target["unhealthy_started_at"] = timestamp
+        target["consecutive_healthy"] = 0
+        if target["consecutive_unhealthy"] >= required_failures:
+            if target["health"] != "down":
+                target["outage_generation"] = (
+                    int(target["outage_generation"]) + 1
+                )
+                target["outage_started_at"] = (
+                    target["unhealthy_started_at"] or timestamp
+                )
+                target["recovery_pending"] = False
+            target["health"] = "down"
+    elif target["health"] == "down":
+        target["consecutive_unhealthy"] = 0
+        target["unhealthy_started_at"] = None
+        target["consecutive_healthy"] = int(target["consecutive_healthy"]) + 1
+        if target["consecutive_healthy"] >= required_successes:
+            target["health"] = "up"
+            recover_now = True
+    else:
+        target["consecutive_unhealthy"] = 0
+        target["unhealthy_started_at"] = None
+        target["health"] = "up"
+        target["consecutive_healthy"] = required_successes
+
+    return HealthTransition(
+        recover_now=recover_now,
+        outage_generation=int(target["outage_generation"]),
+        outage_started_at=target["outage_started_at"],
+        health=str(target["health"]),
+        consecutive_healthy=int(target["consecutive_healthy"]),
+        consecutive_unhealthy=int(target["consecutive_unhealthy"]),
+    )
+
+
+def was_recovered(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    outage_generation: int,
+    thread_id: str,
+) -> bool:
+    target = _target_state(state, target_name)
+    generation = target["recovered"].get(str(outage_generation), {})
+    return thread_id in generation
+
+
+def recovery_record(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    outage_generation: int,
+    thread_id: str,
+) -> dict[str, Any] | None:
+    target = _target_state(state, target_name)
+    value = target["recovered"].get(str(outage_generation), {}).get(thread_id)
+    return value if isinstance(value, dict) else None
+
+
+def recovery_records(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    outage_generation: int,
+) -> dict[str, dict[str, Any]]:
+    target = _target_state(state, target_name)
+    values = target["recovered"].get(str(outage_generation), {})
+    if not isinstance(values, dict):
+        return {}
+    return {
+        str(thread_id): record
+        for thread_id, record in values.items()
+        if isinstance(record, dict)
+    }
+
+
+def is_recovery_pending(
+    state: MutableMapping[str, Any], target_name: str
+) -> bool:
+    return bool(_target_state(state, target_name)["recovery_pending"])
+
+
+def set_recovery_pending(
+    state: MutableMapping[str, Any], target_name: str, pending: bool
+) -> None:
+    _target_state(state, target_name)["recovery_pending"] = bool(pending)
+
+
+def mark_recovered(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    outage_generation: int,
+    thread_id: str,
+    *,
+    action: str,
+    turn_id: str | None,
+    now: int | None = None,
+) -> None:
+    target = _target_state(state, target_name)
+    recovered = target["recovered"]
+    generation = recovered.setdefault(str(outage_generation), {})
+    generation[thread_id] = {
+        "action": action,
+        "turn_id": turn_id,
+        "recorded_at": int(time.time() if now is None else now),
+    }
+
+    generation_numbers = sorted(
+        (int(key), key) for key in recovered if str(key).isdigit()
+    )
+    for _, old_key in generation_numbers[:-8]:
+        recovered.pop(old_key, None)
+
+
+class StateStore:
+    def __init__(self, path: str | Path):
+        self.path = Path(path).expanduser()
+        self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+
+    def load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return default_state()
+        try:
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise StateCorruptionError(
+                f"Guardian state is unreadable; preserved at {self.path}: {exc}"
+            ) from exc
+        if not isinstance(state, dict):
+            raise StateCorruptionError("Guardian state root must be an object")
+        if state.get("schema_version") != SCHEMA_VERSION:
+            raise StateCorruptionError(
+                f"Unsupported Guardian state schema: {state.get('schema_version')!r}"
+            )
+        if not isinstance(state.get("targets"), dict):
+            raise StateCorruptionError("Guardian state targets must be an object")
+        return state
+
+    def save(self, state: MutableMapping[str, Any]) -> None:
+        if state.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("refusing to persist an unsupported state schema")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(state, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

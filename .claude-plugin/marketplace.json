@@ -1,0 +1,21 @@
+{
+  "name": "codex-goal-guardian-local",
+  "owner": {
+    "name": "RoshanDev"
+  },
+  "metadata": {
+    "description": "Local development marketplace for Codex Goal Guardian.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "codex-goal-guardian",
+      "description": "Diagnose and recover eligible active Codex Goals after network outages.",
+      "version": "0.1.0",
+      "author": {
+        "name": "RoshanDev"
+      },
+      "source": "./plugin/codex-goal-guardian"
+    }
+  ]
+}

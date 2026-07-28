@@ -1,0 +1,16 @@
+{
+  "description": "Non-blocking stop-time evidence capture for Codex Goal Guardian.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-record.mjs\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

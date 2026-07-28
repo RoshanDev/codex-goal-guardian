@@ -1,0 +1,82 @@
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from codex_goal_guardian.app_server import AppServerClient, AppServerError
+
+
+class AppServerClientTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.trace_path = Path(self.temporary.name) / "trace.jsonl"
+        server = Path(__file__).parent / "fixtures" / "fake_app_server.py"
+        self.client = AppServerClient(
+            command=(sys.executable, str(server)),
+            codex_home=self.temporary.name,
+            timeout_seconds=2,
+            extra_env={"FAKE_APP_SERVER_TRACE": str(self.trace_path)},
+        )
+        self.addCleanup(self.client.close)
+
+    def test_high_level_calls_use_documented_methods(self) -> None:
+        with self.client:
+            threads = self.client.list_threads(limit=7)
+            goal = self.client.get_goal("thread-1")
+            loaded = self.client.read_thread("thread-1", include_turns=True)
+            resumed = self.client.resume_thread("thread-1")
+            started = self.client.start_turn(
+                "thread-1",
+                prompt="reconcile and continue",
+                client_user_message_id="message-1",
+            )
+
+        self.assertEqual(threads[0]["id"], "thread-1")
+        self.assertEqual(goal["status"], "active")
+        self.assertEqual(loaded["turns"][-1]["status"], "failed")
+        self.assertEqual(resumed["id"], "thread-1")
+        self.assertEqual(started["id"], "turn-recovery")
+
+        messages = [
+            json.loads(line)
+            for line in self.trace_path.read_text(encoding="utf-8").splitlines()
+        ]
+        methods = [message["method"] for message in messages]
+        self.assertEqual(
+            methods,
+            [
+                "initialize",
+                "initialized",
+                "thread/list",
+                "thread/goal/get",
+                "thread/read",
+                "thread/resume",
+                "turn/start",
+            ],
+        )
+        turn_params = messages[-1]["params"]
+        self.assertEqual(
+            turn_params["input"],
+            [{"type": "text", "text": "reconcile and continue"}],
+        )
+        self.assertEqual(turn_params["clientUserMessageId"], "message-1")
+
+    def test_request_timeout_is_bounded(self) -> None:
+        with self.client:
+            with self.assertRaises(AppServerError) as context:
+                self.client.request("hang", {})
+
+        self.assertIn("timed out", str(context.exception))
+
+    def test_protocol_error_includes_method(self) -> None:
+        with self.client:
+            with self.assertRaises(AppServerError) as context:
+                self.client.request("missing/method", {})
+
+        self.assertIn("missing/method", str(context.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

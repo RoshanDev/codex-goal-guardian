@@ -87,7 +87,7 @@ The plugin contributes:
 
 ## Recovery data flow
 
-1. Probe reports unhealthy and records a new outage generation.
+1. Two consecutive probes report unhealthy and record a new outage generation.
 2. Later probes must report healthy twice consecutively.
 3. Guardian queries App Server and computes eligible threads.
 4. For each eligible thread, acquire an atomic per-target lock.
@@ -122,4 +122,3 @@ The plugin contributes:
 6. Repository contains no credentials, auth files, session logs, or machine
    state.
 7. A private GitHub repository is created and the verified commit is pushed.
-
