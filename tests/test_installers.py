@@ -27,6 +27,8 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("/proc/[0-9]*/cmdline", content)
         self.assertIn("Select-Object -First 1", content)
         self.assertIn("$ClearObservations -ge 2", content)
+        self.assertIn("$ProbeFailureAnnounced", content)
+        self.assertIn("Treating the probe as active", content)
         self.assertIn("No tasks were stopped", content)
         self.assertLess(
             content.rindex("Wait-GuardianRecoveryDrain"),

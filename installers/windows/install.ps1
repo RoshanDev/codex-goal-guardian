@@ -153,13 +153,25 @@ function Wait-GuardianRecoveryDrain {
     $Deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     $ClearObservations = 0
     $WaitingAnnounced = $false
+    $ProbeFailureAnnounced = $false
 
     while ($true) {
         $WindowsActive = Test-WindowsRecoveryProcess -Command $WindowsCommand
         $WslActive = $false
         if (-not $SkipWsl) {
-            $WslActive = Test-WslRecoveryProcess `
-                -Distro $Distro -LinuxUser $LinuxUser
+            try {
+                $WslActive = Test-WslRecoveryProcess `
+                    -Distro $Distro -LinuxUser $LinuxUser
+            } catch {
+                $WslActive = $true
+                if (-not $ProbeFailureAnnounced) {
+                    Write-Warning (
+                        "$($_.Exception.Message) Treating the probe as active " +
+                        "and continuing to wait without stopping any task."
+                    )
+                    $ProbeFailureAnnounced = $true
+                }
+            }
         }
 
         if (-not $WindowsActive -and -not $WslActive) {
