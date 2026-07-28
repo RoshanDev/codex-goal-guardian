@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 import unittest
 
+from codex_goal_guardian import __version__
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,6 +27,15 @@ class PluginPackagingTests(unittest.TestCase):
         self.assertFalse((plugin_root / ".git").exists())
         self.assertFalse((plugin_root / "tests").exists())
         self.assertFalse((plugin_root / "src").exists())
+
+        manifest = json.loads(
+            (plugin_root / ".codex-plugin/plugin.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(marketplace["metadata"]["version"], __version__)
+        self.assertEqual(marketplace["plugins"][0]["version"], __version__)
+        self.assertEqual(manifest["version"], __version__)
 
 
 if __name__ == "__main__":

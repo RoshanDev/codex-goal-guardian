@@ -117,6 +117,7 @@ $Configuration = [ordered]@{
             name = "windows"
             command = @($GuardianCommand)
             codex_home = (Join-Path $env:USERPROFILE ".codex")
+            allowed_sources = @("cli", "exec")
             max_thread_age_seconds = 86400
             thread_limit = 50
             resume_grace_seconds = 2

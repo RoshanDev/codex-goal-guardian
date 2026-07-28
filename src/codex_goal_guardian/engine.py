@@ -8,6 +8,7 @@ from typing import Any, Callable, Optional
 from .app_server import AppServerClient
 from .config import GuardianConfig, TargetConfig
 from .health import HealthResult, probe_health
+from .ownership import cli_process_is_running
 from .state import (
     StateStore,
     is_recovery_pending,
@@ -20,8 +21,10 @@ from .state import (
 
 
 _TERMINAL_RECOVERY_ACTIONS = {
+    "recovery_skipped_safety",
     "thread_resumed_goal_changed",
     "thread_resumed_stale",
+    "thread_resumed_turn_completed",
     "turn_completed",
 }
 _STAGED_RECOVERY_ACTIONS = {
@@ -91,14 +94,20 @@ def thread_eligibility(
     if thread_status not in {"idle", "systemError", "notLoaded"}:
         return False, f"thread_{thread_status or 'missing'}"
 
+    source = _thread_source(thread)
+    if source not in target.allowed_sources:
+        return False, f"source_{source or 'missing'}"
+
     turns = thread.get("turns")
     if not isinstance(turns, list) or not turns:
         return False, "turn_missing"
     turn_status = str(turns[-1].get("status", "missing"))
     if turn_status == "inProgress":
         return False, "turn_in_progress"
-    if turn_status not in {"completed", "failed", "interrupted"}:
+    if turn_status not in {"failed", "interrupted"}:
         return False, f"turn_{turn_status}"
+    if not looks_like_network_failure(thread):
+        return False, "turn_not_network_failure"
     return True, "eligible"
 
 
@@ -108,11 +117,13 @@ class RecoveryEngine:
         *,
         probe: Callable[[Any], HealthResult] = probe_health,
         client_factory: Optional[Callable[[TargetConfig], Any]] = None,
+        process_probe: Callable[[TargetConfig], bool] = cli_process_is_running,
         now: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._probe = probe
         self._client_factory = client_factory or self._default_client
+        self._process_probe = process_probe
         self._now = now
         self._sleep = sleep
 
@@ -231,6 +242,11 @@ class RecoveryEngine:
         dry_run: bool,
     ) -> bool:
         try:
+            if self._process_probe(target):
+                report["skipped"].append(
+                    {"thread_id": None, "reason": "cli_process_running"}
+                )
+                return False
             client_context = self._client_factory(target)
             with client_context as client:
                 summaries = client.list_threads(limit=target.thread_limit)
@@ -306,13 +322,31 @@ class RecoveryEngine:
                                     }
                                 )
                             elif (
+                                record_action in _STAGED_RECOVERY_ACTIONS
+                                and _is_safety_rejection(reason)
+                            ):
+                                if not dry_run:
+                                    mark_recovered(
+                                        state,
+                                        target.name,
+                                        outage_generation,
+                                        thread_id,
+                                        action="recovery_skipped_safety",
+                                        turn_id=None,
+                                        now=now,
+                                    )
+                                    store.save(state)
+                                report["actions"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "action": "recovery_skipped_safety",
+                                        "reason": reason,
+                                    }
+                                )
+                            elif (
                                 target.start_recovery_turn
                                 and not terminal
-                                and (
-                                    reason in _WAITING_RECOVERY_REASONS
-                                    or record_action
-                                    in _STAGED_RECOVERY_ACTIONS
-                                )
+                                and reason in _WAITING_RECOVERY_REASONS
                             ):
                                 recovery_waiting = True
                             report["skipped"].append(
@@ -424,6 +458,23 @@ class RecoveryEngine:
                                     }
                                 )
                                 continue
+                            mark_recovered(
+                                state,
+                                target.name,
+                                outage_generation,
+                                thread_id,
+                                action="thread_resumed_turn_completed",
+                                turn_id=None,
+                                now=now,
+                            )
+                            store.save(state)
+                            report["actions"].append(
+                                {
+                                    "thread_id": thread_id,
+                                    "action": "thread_resumed_turn_completed",
+                                }
+                            )
+                            continue
 
                         if not target.start_recovery_turn:
                             mark_recovered(
@@ -554,6 +605,25 @@ def _thread_status(thread: dict[str, Any]) -> str:
     if isinstance(status, dict):
         return str(status.get("type", ""))
     return str(status or "")
+
+
+def _thread_source(thread: dict[str, Any]) -> str:
+    source = thread.get("source")
+    if isinstance(source, str):
+        return source.strip().lower()
+    if isinstance(source, dict):
+        for key in ("type", "kind"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+    return ""
+
+
+def _is_safety_rejection(reason: str) -> bool:
+    return reason.startswith("source_") or reason in {
+        "turn_completed",
+        "turn_not_network_failure",
+    }
 
 
 def _has_staged_recovery(

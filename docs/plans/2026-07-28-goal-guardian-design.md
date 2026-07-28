@@ -10,24 +10,24 @@ Build an update-resilient recovery layer for:
 - Codex CLI running natively on Windows;
 - Codex CLI running in WSL2 Ubuntu 22.04.
 
-After the network transitions from unavailable to healthy, the guardian must
-resume only eligible threads whose persisted Goal is still active and whose
-last turn is no longer running. It must not repeat a recovery action for the
-same thread and outage generation.
+After the network transitions from unavailable to healthy, recovery must
+continue an active Goal without creating a second owner or overlapping turn.
+It must not repeat a recovery action for the same thread and outage generation.
 
 ## Chosen approach
 
-Use a standalone, standard-library Python supervisor as the authority. Package
-Codex Skill and Hook files as a supported plugin, but keep the supervisor and
-its state outside the desktop app installation.
+Split ownership along supported runtime boundaries:
 
-The supervisor talks to a compatible Codex CLI through the documented App
-Server JSON-RPC interface. It never patches `app.asar`, clicks the UI, or writes
-Codex SQLite state directly.
+- The Windows desktop app uses a native in-chat heartbeat attached to the same
+  task. It inherits task context and does nothing while another turn is active.
+- Native Windows and WSL2 CLIs use a standalone standard-library Python
+  supervisor. It talks to a compatible Codex CLI through documented App Server
+  JSON-RPC and rejects desktop `source=vscode` tasks.
 
-Windows Task Scheduler is the primary host because it survives desktop app
-updates and can start WSL when necessary. A WSL systemd user timer is provided
-as an optional CLI-only fallback.
+The implementation never patches `app.asar`, clicks the UI, or writes Codex
+SQLite state directly. Windows Task Scheduler hosts the CLI supervisor because
+it survives desktop app updates and can start WSL when necessary. A WSL
+systemd user timer is an optional CLI-only fallback.
 
 ## Alternatives considered
 
@@ -37,9 +37,11 @@ as an optional CLI-only fallback.
 2. Hook only: a Stop hook can request another continuation, but cannot reliably
    wait through a long outage or restart a dead app process. Retained only for
    lightweight failure evidence.
-3. Fixed-interval thread heartbeat only: update-safe and useful as a fallback,
-   but it is timer-driven rather than network-transition-driven. Retained as an
-   optional second recovery layer.
+3. External App Server for desktop tasks: a fresh App Server reports the
+   desktop thread as locally `notLoaded` and cannot see the desktop process's
+   live turn ownership. Rejected because it can create overlapping turns.
+4. Fixed-interval in-chat heartbeat: update-safe and owns the existing desktop
+   task context. Chosen for the desktop layer with a strict active-turn guard.
 
 ## Components
 
@@ -48,19 +50,26 @@ as an optional CLI-only fallback.
 - probes configured network endpoints and optional local proxy ports;
 - persists health state and increments an outage generation on a healthy to
   unhealthy transition;
+- waits while any process matching the configured native CLI command is alive;
 - starts one App Server subprocess per recovering runtime target and keeps that
   connection attached while a resumed or recovery turn remains active;
 - initializes the JSON-RPC connection and feature-probes required methods;
 - lists recent threads, reads Goals, and inspects the final turn;
-- selects only active Goal + idle/system-error/not-loaded threads;
+- selects only `cli`/`exec` source threads with an active Goal, an
+  idle/system-error/not-loaded status, and an explicit network-failed or
+  network-interrupted final turn;
 - rejects active turns, paused/blocked/limited/completed Goals, stale threads,
-  and already-recovered outage/thread pairs;
-- resumes the thread, waits on the same connection if resume makes it active,
-  then starts and follows an idempotent reconciliation turn only when needed.
+  non-network failures, desktop sources, and already-recovered outage/thread
+  pairs;
+- resumes the thread and waits on the same connection if resume makes it
+  active; in that case it never starts a second turn;
+- starts and follows one idempotent reconciliation turn only when resume leaves
+  the thread idle.
 
 ### Runtime targets
 
-- `windows`: native Windows Codex CLI and Windows `CODEX_HOME`;
+- `windows`: native Windows Codex CLI and Windows `CODEX_HOME`; desktop tasks
+  sharing that home are excluded by source;
 - `wsl`: WSL Codex CLI and Linux `CODEX_HOME`.
 
 The installer records absolute executable paths after verifying the CLI
@@ -85,7 +94,8 @@ PATH, which currently resolves a Windows shim under Node 12.
 
 The plugin contributes:
 
-- a Skill for doctor/install/status/recovery workflows;
+- a Skill that routes desktop tasks to native heartbeat recovery and CLI tasks
+  to external doctor/install/status/recovery workflows;
 - a Stop hook that records compact failure evidence without blocking normal
   turns;
 - scripts that delegate to the externally installed Guardian.
@@ -94,16 +104,21 @@ The plugin contributes:
 
 1. Two consecutive probes report unhealthy and record a new outage generation.
 2. Later probes must report healthy twice consecutively.
-3. Guardian queries App Server and computes eligible threads.
-4. For each eligible thread, acquire an atomic per-target lock.
+3. Guardian acquires the per-target state lock and proves no configured native
+   CLI process is still running.
+4. Guardian queries App Server and computes eligible CLI threads.
 5. Re-read thread and Goal to close the race with a user or another client.
-6. Call `thread/resume`.
-7. If resume makes the thread active, keep that App Server connection open
-   until the turn settles.
-8. If configured and the Goal remains active, call `turn/start` with a
+6. Reject non-CLI sources and non-network terminal turns.
+7. Call `thread/resume`.
+8. If resume makes the thread active, keep that App Server connection open
+   until the turn settles and do not call `turn/start`.
+9. If the thread remains idle and the Goal remains active, call `turn/start` with a
    deterministic recovery prompt and `clientUserMessageId` derived from target,
    outage generation, and thread ID, then stay attached until completion.
-9. Persist the successful action before releasing the lock.
+10. Persist the successful action before releasing the lock.
+
+For desktop tasks, the in-chat heartbeat is scheduled independently. A run
+continues only when the Goal is active and no other turn is `inProgress`.
 
 ## Failure behavior
 
@@ -113,6 +128,8 @@ The plugin contributes:
 - Approval request during a recovery turn: leave the thread waiting for the
   user and do not retry the same outage generation.
 - Multiple guardians: the state lock permits one recovery writer.
+- Existing native CLI process: keep the outage recovery pending and retry later.
+- Desktop source: fail closed and leave recovery to the same-task heartbeat.
 - Corrupt Guardian state: preserve the bad file, start in observe-only mode,
   and require an explicit repair command.
 
@@ -129,4 +146,5 @@ The plugin contributes:
 5. Plugin validation passes.
 6. Repository contains no credentials, auth files, session logs, or machine
    state.
-7. A private GitHub repository is created and the verified commit is pushed.
+7. A public GitHub repository contains no credentials or local machine state,
+   and the verified commit is pushed.

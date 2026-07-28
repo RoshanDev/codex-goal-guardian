@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Local development marketplace for Codex Goal Guardian.",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
   "plugins": [
     {
       "name": "codex-goal-guardian",
-      "description": "Diagnose and recover eligible active Codex Goals after network outages.",
-      "version": "0.1.0",
+      "description": "Keep desktop and CLI Codex Goals recoverable without overlapping turns.",
+      "version": "0.2.0",
       "author": {
         "name": "RoshanDev"
       },

@@ -34,9 +34,11 @@ def make_thread(
     turn_status: str = "failed",
     updated_at: int = 110,
     error_message: str = "stream disconnected before completion",
+    source: str = "cli",
 ) -> dict:
     return {
         "id": "thread-1",
+        "source": source,
         "status": {"type": thread_status},
         "updatedAt": updated_at,
         "turns": [
@@ -77,7 +79,7 @@ class EligibilityTests(unittest.TestCase):
 
         self.assertFalse(looks_like_network_failure(thread))
 
-    def test_idle_completed_turn_is_eligible(self) -> None:
+    def test_idle_completed_turn_is_rejected(self) -> None:
         eligible, reason = thread_eligibility(
             make_thread(turn_status="completed", error_message=""),
             self.goal,
@@ -86,7 +88,32 @@ class EligibilityTests(unittest.TestCase):
             already_recovered=False,
         )
 
-        self.assertTrue(eligible, reason)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "turn_completed")
+
+    def test_non_network_failed_turn_is_rejected(self) -> None:
+        eligible, reason = thread_eligibility(
+            make_thread(error_message="tool command returned exit code 2"),
+            self.goal,
+            self.target,
+            now=150,
+            already_recovered=False,
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "turn_not_network_failure")
+
+    def test_desktop_vscode_thread_is_rejected(self) -> None:
+        eligible, reason = thread_eligibility(
+            make_thread(source="vscode"),
+            self.goal,
+            self.target,
+            now=150,
+            already_recovered=False,
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "source_vscode")
 
     def test_running_turn_is_rejected(self) -> None:
         eligible, reason = thread_eligibility(
@@ -259,7 +286,7 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertTrue(first["targets"][0]["errors"])
         self.assertEqual(second["targets"][0]["actions"][0]["action"], "turn_started")
 
-    def test_active_turn_after_resume_stays_attached_until_idle(self) -> None:
+    def test_active_turn_after_resume_is_followed_without_second_turn(self) -> None:
         client = _FakeClient(
             read_sequence=[
                 make_thread(),
@@ -294,17 +321,13 @@ class RecoveryEngineTests(unittest.TestCase):
                 1,
                 "thread-1",
             )["action"],
-            "turn_completed",
+            "thread_resumed_turn_completed",
         )
         self.assertEqual(client.resume_calls, 1)
-        self.assertEqual(client.start_calls, 1)
+        self.assertEqual(client.start_calls, 0)
         self.assertEqual(
             report["targets"][0]["actions"][1]["action"],
-            "turn_started",
-        )
-        self.assertEqual(
-            report["targets"][0]["actions"][2]["action"],
-            "turn_completed",
+            "thread_resumed_turn_completed",
         )
 
     def test_initial_active_turn_stays_pending_until_idle(self) -> None:
@@ -318,6 +341,8 @@ class RecoveryEngineTests(unittest.TestCase):
         )
         second_client = _FakeClient(
             read_sequence=[
+                make_thread(),
+                make_thread(),
                 make_thread(turn_status="completed"),
                 make_thread(turn_status="completed"),
             ]
@@ -381,6 +406,69 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual(
             report["targets"][0]["actions"][0]["action"],
             "turn_started",
+        )
+
+    def test_staged_desktop_recovery_is_closed_without_mutation(self) -> None:
+        state = self.store.load()
+        mark_recovered(
+            state,
+            "wsl",
+            1,
+            "thread-1",
+            action="thread_resumed_active",
+            turn_id=None,
+            now=115,
+        )
+        self.store.save(state)
+        desktop = make_thread(source="vscode")
+        client = _FakeClient(
+            listed_thread=desktop,
+            read_sequence=[desktop],
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(self.config)
+
+        self.assertEqual(report["targets"][0]["status"], "recovered")
+        self.assertEqual(client.resume_calls, 0)
+        self.assertEqual(client.start_calls, 0)
+        self.assertEqual(
+            report["targets"][0]["actions"][0]["action"],
+            "recovery_skipped_safety",
+        )
+        self.assertEqual(
+            recovery_record(
+                self.store.load(),
+                "wsl",
+                1,
+                "thread-1",
+            )["action"],
+            "recovery_skipped_safety",
+        )
+
+    def test_running_native_cli_process_defers_recovery(self) -> None:
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: self.fail("client should not start"),
+            process_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(self.config)
+
+        self.assertEqual(
+            report["targets"][0]["status"],
+            "recovery_pending",
+        )
+        self.assertEqual(
+            report["targets"][0]["skipped"][0]["reason"],
+            "cli_process_running",
         )
 
     def test_dry_run_reports_candidate_without_mutating_thread(self) -> None:

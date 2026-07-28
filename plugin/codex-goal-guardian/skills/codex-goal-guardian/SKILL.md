@@ -10,8 +10,11 @@ attempts, whether Guardian is installed, or how to inspect its recovery state.
 
 ## Safety contract
 
-- Treat the external Guardian as the recovery authority.
+- Treat an in-chat heartbeat as the desktop-task recovery authority.
+- Treat the external Guardian as the native Windows/WSL CLI recovery authority.
 - Prefer `doctor`, `status`, and `run-once --dry-run` before live recovery.
+- Never use external App Server recovery for a `source=vscode` desktop task.
+- Never recover while a matching native CLI process is still running.
 - Never patch the desktop app package, edit Codex session databases, or delete
   Codex configuration, authentication, sessions, or project files.
 - A live `run-once` is appropriate only after an observed down-to-up health
@@ -39,9 +42,11 @@ For a read-only recovery preview, replace `doctor` with
 
 ## Diagnosis order
 
-1. Run `doctor` for the affected native runtime.
-2. Confirm the resolved WSL executable is a Linux path and not a Windows shim.
-3. Inspect `status` for health, outage generation, and `recovery_pending`.
-4. Inspect the Guardian JSONL log and scheduler/timer state.
-5. If the App Server contract is unavailable, fail closed and report the
+1. For a desktop task, inspect or create one in-chat heartbeat whose first rule
+   is to do nothing when another turn is already `inProgress`.
+2. For CLI, run `doctor` for the affected native runtime.
+3. Confirm the resolved WSL executable is a Linux path and not a Windows shim.
+4. Inspect `status` for health, outage generation, and `recovery_pending`.
+5. Inspect the Guardian JSONL log and scheduler/timer state.
+6. If the App Server contract is unavailable, fail closed and report the
    compatibility issue.

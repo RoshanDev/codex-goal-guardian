@@ -2,7 +2,8 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Build, install, and privately publish an update-resilient recovery supervisor for Windows App/CLI and WSL2 Codex CLI Goals.
+**Goal:** Build, install, and publicly publish update-resilient desktop
+heartbeat plus Windows/WSL2 CLI recovery for Codex Goals.
 
 **Architecture:** A Python 3.10+ standard-library package owns health transitions, state locking, App Server JSON-RPC, candidate selection, and recovery. Windows Task Scheduler hosts the primary periodic checks; WSL receives a native install plus an optional user timer. A supported Codex plugin contributes a diagnostic Skill and non-blocking Stop hook.
 
@@ -111,11 +112,11 @@
 5. Run observe-only checks; do not force-resume a healthy live thread.
 6. Verify task definitions, installed paths, logs, and config contain no credentials.
 
-### Task 8: Publish privately
+### Task 8: Publish publicly
 
 **Steps:**
 1. Run the full test suite and plugin validation.
 2. Inspect `git status`, staged diff, and secret scan.
 3. Commit implementation on `main`.
-4. Use authenticated WSL `gh repo create codex-goal-guardian --private --source . --remote origin --push`.
+4. Use authenticated WSL `gh repo create codex-goal-guardian --public --source . --remote origin --push`, or change the existing repository visibility after confirming the tree contains no secrets.
 5. Verify GitHub visibility is `PRIVATE`, remote HEAD matches local HEAD, and no unintended files were pushed.

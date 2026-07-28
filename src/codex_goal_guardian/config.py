@@ -22,6 +22,7 @@ class TargetConfig:
     name: str
     command: tuple[str, ...]
     codex_home: str
+    allowed_sources: tuple[str, ...] = ("cli", "exec")
     max_thread_age_seconds: int = 86_400
     thread_limit: int = 50
     resume_grace_seconds: float = 2.0
@@ -104,6 +105,7 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
         name=str(data["name"]),
         command=tuple(command),
         codex_home=str(data["codex_home"]),
+        allowed_sources=_allowed_sources(data.get("allowed_sources")),
         max_thread_age_seconds=int(data.get("max_thread_age_seconds", 86_400)),
         thread_limit=int(data.get("thread_limit", 50)),
         resume_grace_seconds=float(data.get("resume_grace_seconds", 2.0)),
@@ -122,3 +124,20 @@ def _optional_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _allowed_sources(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ("cli", "exec")
+    if not isinstance(value, list):
+        raise ValueError("target allowed_sources must be a non-empty string array")
+    normalized = tuple(
+        dict.fromkeys(
+            item.strip().lower()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        )
+    )
+    if not normalized or len(normalized) != len(value):
+        raise ValueError("target allowed_sources must be a non-empty string array")
+    return normalized

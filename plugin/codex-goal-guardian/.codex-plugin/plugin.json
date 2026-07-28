@@ -1,7 +1,7 @@
 {
   "name": "codex-goal-guardian",
-  "version": "0.1.0",
-  "description": "Diagnose and recover eligible active Codex Goals after network outages.",
+  "version": "0.2.0",
+  "description": "Keep desktop and CLI Codex Goals recoverable without overlapping turns.",
   "author": {
     "name": "RoshanDev",
     "url": "https://github.com/RoshanDev"
@@ -17,8 +17,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Goal Guardian",
-    "shortDescription": "Recover active Goals after connectivity returns.",
-    "longDescription": "Diagnoses Windows and WSL Codex runtimes and operates the external, update-resilient Goal Guardian supervisor.",
+    "shortDescription": "Resume active Goals without duplicate turns.",
+    "longDescription": "Routes desktop recovery to a same-task heartbeat and Windows/WSL CLI recovery to an ownership-safe external supervisor.",
     "developerName": "RoshanDev",
     "category": "Productivity",
     "capabilities": [

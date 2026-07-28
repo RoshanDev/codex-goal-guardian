@@ -26,6 +26,7 @@ class InstallerInvariantTests(unittest.TestCase):
             3,
         )
         self.assertGreaterEqual(content.count("--windows-hidden-child"), 2)
+        self.assertIn("allowed_sources", content)
         self.assertNotIn('New-ScheduledTaskAction -Execute $WslPath', content)
         self.assertNotIn(
             'New-ScheduledTaskAction -Execute $PowerShellPath',
@@ -47,6 +48,7 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("--with-systemd", content)
         self.assertIn("--node-command", content)
         self.assertIn("GUARDIAN_COMMAND_1", content)
+        self.assertIn('"allowed_sources"', content)
         self.assertNotIn("/mnt/c/", content)
 
     def test_uninstallers_remove_only_guardian_owned_names(self) -> None:
