@@ -3,35 +3,36 @@
 Codex Goal Guardian keeps active Codex Goals recoverable after the built-in
 reconnect limit. It deliberately uses two ownership-safe recovery paths:
 
-- an explicit local thread allowlist plus an opt-in external recovery supervisor
-  for the Windows ChatGPT/Codex desktop app;
+- a shared loopback App Server used by both the Windows ChatGPT/Codex desktop
+  app and an explicit local thread allowlist watcher;
 - an external recovery supervisor for native Windows Codex CLI and Codex CLI
   running inside WSL2 Ubuntu 22.04.
 
-The CLI supervisor lives in stable user directories and uses the documented
-Codex App Server JSON-RPC surface. For desktop `source=vscode` tasks it may
-only inspect IDs explicitly pinned in `desktop_thread_ids` or process a legacy
-same-task request. It re-reads safety state twice and calls only
-`thread/goal/set(status=active)` for the legacy path. An explicitly allowlisted
-task also opts into a guarded `thread/resume` plus one deterministic
-`turn/start` when the app has left the task idle. Desktop app updates do not
-overwrite the supervisor, plugin, scheduled tasks, configuration, or recovery
-state.
+The supervisor lives in stable user directories and uses the Codex App Server
+JSON-RPC surface. The Windows installer starts one hidden App Server at
+`ws://127.0.0.1:<port>/rpc` and persists the desktop app's supported
+`CODEX_APP_SERVER_WS_URL` setting. Guardian connects to that exact server
+instead of launching a second stdio runtime. A Goal update is therefore
+observable by the desktop renderer as `thread/goal/updated`, and the bottom
+Goal card and Guardian read the same state. Desktop app updates do not
+overwrite the user environment setting, supervisor, plugin, scheduled tasks,
+configuration, or recovery state.
 
 ## Why this survives updates
 
 The Windows app package, `app.asar`, private UI bridges, and versioned editor
-extensions are outside the trust boundary. The external helper takes over only
-an explicitly allowlisted task after the app has left it idle because of an
-exact persisted network failure. It keeps the recovery App Server attached
-while the continuation runs.
+extensions are outside the trust boundary. Guardian uses the desktop app's
+supported App Server WebSocket setting and never patches the package. It acts
+only on an explicitly allowlisted task after the shared runtime has left it
+idle because of an exact persisted network failure.
 
 Windows Task Scheduler launches 15-second native Windows and WSL CLI watchers;
-an optional WSL user timer is a fallback. A one-minute watchdog restarts either
-watcher if it exits. All three Windows tasks enter through `pythonw.exe`; WSL
-and PowerShell children use the Windows `CREATE_NO_WINDOW` flag, so scheduled
-monitoring does not leave visible console windows. Native Codex App Server
-recovery children use the same flag. The standalone runtime is copied to:
+an optional WSL user timer is a fallback. A fourth Windows task hosts the
+shared loopback App Server, and a one-minute watchdog restarts the server or
+either watcher if it exits. All four Windows tasks enter through
+`pythonw.exe`; App Server, WSL, and PowerShell children use the Windows
+`CREATE_NO_WINDOW` flag, so scheduled monitoring does not leave visible
+console windows. The standalone runtime is copied to:
 
 - Windows: `%LOCALAPPDATA%\CodexGoalGuardian`
 - WSL2: `~/.local/share/codex-goal-guardian`
@@ -50,7 +51,12 @@ turn. Codex App Server can normalize some failed remote-compaction turns to
 the task's append-only session JSONL when the App Server error is empty.
 Session logs are read-only and never edited.
 
-Immediately before mutation the watcher reads the thread and Goal again. It
+The desktop target is invalid without `app_server_url`; Guardian fails closed
+instead of silently spawning the separate stdio runtime that cannot update the
+native Goal card. During a 0.5.x migration it also detects the old packaged
+`app-server` child and waits until the Desktop app has restarted onto the
+shared runtime. Immediately before mutation the watcher reads the thread and
+Goal again. It
 changes only Goal status to `active`, verifies objective, budget, usage
 accounting, and creation time were preserved, and records the failure turn ID.
 It then waits, reads thread and Goal twice again, calls `thread/resume`, and
@@ -111,10 +117,10 @@ underlying transport:
   thread with an interactive owner from an orphaned loaded thread.
 
 Until the last two capabilities exist, there is no perfect subscriber-presence
-proof. Guardian therefore makes external Desktop wake an explicit allowlist
-opt-in, rejects any active/in-progress task, performs repeated safety reads,
-and uses a deterministic start ID. The legacy request path remains Goal-state
-only.
+proof. Sharing the desktop runtime removes the former split-brain Goal state,
+while Guardian still makes Desktop wake an explicit allowlist opt-in, rejects
+any active/in-progress task, performs repeated safety reads, and uses a
+deterministic start ID.
 
 ## Requirements
 
@@ -143,6 +149,11 @@ update-safe:
 Pass several IDs as a PowerShell array when guarding more than one task.
 Rerunning the installer without `-DesktopThreadId` preserves the existing
 allowlist. Passing it again replaces the allowlist intentionally.
+
+The installer does not stop or restart Codex Desktop. After the current task is
+safely idle, close and reopen the app once so its new main process reads
+`CODEX_APP_SERVER_WS_URL`. That one restart is required when migrating from
+0.5.x; later Desktop app updates continue to inherit the user-level setting.
 
 The legacy `request-desktop-recovery` heartbeat path remains available for
 installations that do not configure an allowlist. It is no longer recommended
@@ -240,7 +251,8 @@ codex plugin add codex-goal-guardian@codex-goal-guardian-local
 ```
 
 Start a new task after plugin installation so Codex loads the new Skill and
-Hook. App updates do not change the external runtime or scheduled tasks.
+Hook. App updates do not change the shared App Server setting, external runtime,
+or scheduled tasks.
 
 ## Updating and uninstalling
 
@@ -280,9 +292,13 @@ and logs should also be deleted.
 ## Limitations
 
 - Codex can still display its built-in `reconnecting /5` sequence. Guardian
-  does not replace that UI transport stream. Desktop continuity comes from the
-  local Goal-state watcher; CLI continuity starts after the original CLI
-  process exits and network recovery is confirmed.
+  does not replace that remote Responses stream. After the failed turn settles,
+  the local watcher reactivates and continues the Goal through the same App
+  Server runtime used by the desktop renderer. CLI continuity starts after the
+  original CLI process exits and network recovery is confirmed.
+- Migrating from 0.5.x requires one safe Desktop app restart after installation.
+  Until then, the already-running app still owns its old embedded App Server
+  and Guardian deliberately reports the shared runtime as unavailable.
 - Guardian cannot continue work that is waiting for user input or approval.
 - An incompatible future App Server schema fails closed; it never falls back
   to direct database edits or UI automation.

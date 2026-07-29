@@ -15,6 +15,7 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("CodexGoalGuardian-Windows", content)
         self.assertIn("CodexGoalGuardian-WSL", content)
         self.assertIn("CodexGoalGuardian-Watchdog", content)
+        self.assertIn("CodexGoalGuardian-AppServer", content)
         self.assertIn("[switch]$DryRun", content)
         self.assertIn("Register-ScheduledTask", content)
         self.assertIn("watch --config", content)
@@ -33,6 +34,10 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("Update-GuardianConfig", content)
         self.assertIn("windows-desktop-goal-state", content)
         self.assertIn('recovery_mode = "desktop_goal_state"', content)
+        self.assertIn("app_server_url", content)
+        self.assertIn("CODEX_APP_SERVER_WS_URL", content)
+        self.assertIn("ws://127.0.0.1:", content)
+        self.assertIn("Set-DesktopAppServerEnvironment", content)
         self.assertIn('allowed_sources = @("vscode")', content)
         self.assertIn("[string[]]$DesktopThreadId", content)
         self.assertIn("desktop_thread_ids", content)
@@ -51,7 +56,7 @@ class InstallerInvariantTests(unittest.TestCase):
         )
         self.assertEqual(
             content.count("New-ScheduledTaskAction -Execute $PythonwPath"),
-            3,
+            4,
         )
         self.assertGreaterEqual(content.count("--windows-hidden-child"), 2)
         self.assertIn("allowed_sources", content)
@@ -91,6 +96,8 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("CodexGoalGuardian-Windows", windows)
         self.assertIn("CodexGoalGuardian-WSL", windows)
         self.assertIn("CodexGoalGuardian-Watchdog", windows)
+        self.assertIn("CodexGoalGuardian-AppServer", windows)
+        self.assertIn("CODEX_APP_SERVER_WS_URL", windows)
         self.assertIn("codex-goal-guardian", wsl)
         self.assertNotIn(".codex", windows)
         self.assertNotIn('rm -rf "$HOME"', wsl)

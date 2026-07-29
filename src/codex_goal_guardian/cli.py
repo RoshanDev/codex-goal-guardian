@@ -16,6 +16,7 @@ from .app_server import AppServerClient
 from .config import GuardianConfig, load_config
 from .engine import RecoveryEngine
 from .health import probe_health
+from .ownership import desktop_uses_shared_app_server
 from .state import StateStore, enqueue_desktop_recovery_request
 
 
@@ -193,8 +194,33 @@ def doctor_config(
             target.name,
             target.command,
             target.codex_home,
+            app_server_url=target.app_server_url,
             is_wsl=wsl,
         )
+        if target.recovery_mode == "desktop_goal_state":
+            try:
+                shared_runtime_active = desktop_uses_shared_app_server(target)
+            except Exception as error:
+                shared_runtime_active = False
+                target_report["errors"].append(
+                    "desktop_shared_runtime_probe_failed: "
+                    f"{type(error).__name__}: {error}"[:700]
+                )
+            target_report["desktop_shared_runtime_active"] = (
+                shared_runtime_active
+            )
+            if (
+                not shared_runtime_active
+                and not any(
+                    str(item).startswith(
+                        "desktop_shared_runtime_probe_failed:"
+                    )
+                    for item in target_report["errors"]
+                )
+            ):
+                target_report["errors"].append(
+                    "desktop_shared_runtime_not_active"
+                )
         report["targets"].append(target_report)
         if target_report["errors"]:
             report["ok"] = False
@@ -231,6 +257,7 @@ def inspect_target(
     command: Sequence[str],
     codex_home: str,
     *,
+    app_server_url: str | None = None,
     is_wsl: bool,
 ) -> dict[str, Any]:
     requested = str(command[0])
@@ -240,6 +267,10 @@ def inspect_target(
         "command": list(command),
         "resolved_executable": resolved,
         "codex_home": str(Path(codex_home).expanduser()),
+        "app_server_url": app_server_url,
+        "app_server_transport": (
+            "shared_websocket" if app_server_url else "isolated_stdio"
+        ),
         "version": None,
         "app_server": False,
         "app_server_rpc": False,
@@ -281,13 +312,18 @@ def inspect_target(
         try:
             with AppServerClient(
                 command=(
-                    *resolved_command,
-                    "app-server",
-                    "--listen",
-                    "stdio://",
+                    resolved_command
+                    if app_server_url
+                    else (
+                        *resolved_command,
+                        "app-server",
+                        "--listen",
+                        "stdio://",
+                    )
                 ),
                 codex_home=codex_home,
                 timeout_seconds=20,
+                websocket_url=app_server_url,
             ) as client:
                 threads = client.list_threads(limit=1)
                 if (

@@ -21,6 +21,44 @@ def cli_process_is_running(target: TargetConfig) -> bool:
     return _proc_cli_process_is_running(target.command)
 
 
+def desktop_uses_shared_app_server(target: TargetConfig) -> bool:
+    """Return whether Codex Desktop has left its embedded App Server."""
+    if os.name != "nt":
+        return True
+    if (
+        not target.app_server_url
+        or os.environ.get("CODEX_APP_SERVER_WS_URL") != target.app_server_url
+    ):
+        return False
+
+    return _desktop_processes_use_shared_app_server(
+        _windows_process_records()
+    )
+
+
+def _desktop_processes_use_shared_app_server(
+    records: Iterable[dict[str, object]],
+) -> bool:
+    app_running = False
+    embedded_app_server_running = False
+    for record in records:
+        line = " ".join(
+            str(record.get(key) or "")
+            for key in ("ExecutablePath", "CommandLine")
+        )
+        normalized = line.replace("\\", "/").casefold()
+        if "/windowsapps/openai.codex_" not in normalized:
+            continue
+        if "/app/resources/codex.exe" in normalized and "app-server" in normalized:
+            embedded_app_server_running = True
+        elif (
+            "/app/chatgpt.exe" in normalized
+            or "/app/codex.exe" in normalized
+        ):
+            app_running = True
+    return app_running and not embedded_app_server_running
+
+
 def _proc_cli_process_is_running(command: Sequence[str]) -> bool:
     proc_root = Path("/proc")
     if not proc_root.is_dir():
@@ -43,6 +81,20 @@ def _proc_cli_process_is_running(command: Sequence[str]) -> bool:
 
 
 def _windows_cli_process_is_running(command: Sequence[str]) -> bool:
+    records = _windows_process_records()
+    for record in records:
+        if int(record.get("ProcessId") or -1) == os.getpid():
+            continue
+        line = " ".join(
+            str(record.get(key) or "")
+            for key in ("ExecutablePath", "CommandLine")
+        )
+        if _command_line_matches(line, command):
+            return True
+    return False
+
+
+def _windows_process_records() -> list[dict[str, object]]:
     powershell = shutil.which("powershell.exe") or shutil.which("powershell")
     if powershell is None:
         raise RuntimeError("powershell is required for process ownership probe")
@@ -78,18 +130,7 @@ def _windows_cli_process_is_running(command: Sequence[str]) -> bool:
             "Windows process ownership probe returned invalid JSON"
         ) from error
     records = payload if isinstance(payload, list) else [payload]
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        if int(record.get("ProcessId") or -1) == os.getpid():
-            continue
-        line = " ".join(
-            str(record.get(key) or "")
-            for key in ("ExecutablePath", "CommandLine")
-        )
-        if _command_line_matches(line, command):
-            return True
-    return False
+    return [record for record in records if isinstance(record, dict)]
 
 
 def _arguments_match_command(

@@ -9,6 +9,7 @@ from codex_goal_guardian.config import TargetConfig
 from codex_goal_guardian.ownership import (
     _arguments_match_command,
     _command_line_matches,
+    _desktop_processes_use_shared_app_server,
     cli_process_is_running,
 )
 
@@ -102,6 +103,32 @@ class OwnershipProbeTests(unittest.TestCase):
         )
 
         self.assertTrue(cli_process_is_running(target))
+
+    def test_desktop_shared_runtime_requires_no_embedded_child(self) -> None:
+        app = {
+            "ExecutablePath": (
+                "C:\\Program Files\\WindowsApps\\"
+                "OpenAI.Codex_1.0_x64__test\\app\\ChatGPT.exe"
+            ),
+            "CommandLine": "ChatGPT.exe",
+        }
+        embedded = {
+            "ExecutablePath": (
+                "C:\\Program Files\\WindowsApps\\"
+                "OpenAI.Codex_1.0_x64__test\\app\\resources\\codex.exe"
+            ),
+            "CommandLine": "codex.exe app-server",
+        }
+
+        self.assertTrue(
+            _desktop_processes_use_shared_app_server([app])
+        )
+        self.assertFalse(
+            _desktop_processes_use_shared_app_server([app, embedded])
+        )
+        self.assertFalse(
+            _desktop_processes_use_shared_app_server([])
+        )
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:

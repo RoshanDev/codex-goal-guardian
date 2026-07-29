@@ -12,7 +12,10 @@ from typing import Any, Callable, Optional
 from .app_server import AppServerClient, AppServerError
 from .config import GuardianConfig, TargetConfig
 from .health import HealthResult, probe_health
-from .ownership import cli_process_is_running
+from .ownership import (
+    cli_process_is_running,
+    desktop_uses_shared_app_server,
+)
 from .state import (
     StateStore,
     desktop_direct_recovery_record,
@@ -197,12 +200,16 @@ class RecoveryEngine:
         probe: Callable[[Any], HealthResult] = probe_health,
         client_factory: Optional[Callable[[TargetConfig], Any]] = None,
         process_probe: Callable[[TargetConfig], bool] = cli_process_is_running,
+        desktop_runtime_probe: Callable[
+            [TargetConfig], bool
+        ] = desktop_uses_shared_app_server,
         now: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._probe = probe
         self._client_factory = client_factory or self._default_client
         self._process_probe = process_probe
+        self._desktop_runtime_probe = desktop_runtime_probe
         self._now = now
         self._sleep = sleep
 
@@ -579,6 +586,22 @@ class RecoveryEngine:
                                 )
                                 continue
 
+                        if (
+                            target.app_server_url is not None
+                            and not self._desktop_runtime_probe(target)
+                        ):
+                            if requested:
+                                recovery_waiting = True
+                            report["skipped"].append(
+                                {
+                                    "thread_id": thread_id,
+                                    "reason": (
+                                        "desktop_shared_runtime_not_active"
+                                    ),
+                                }
+                            )
+                            continue
+
                         if dry_run:
                             action = {
                                 "thread_id": thread_id,
@@ -685,6 +708,23 @@ class RecoveryEngine:
                                     }
                                 )
                                 continue
+
+                        if (
+                            target.app_server_url is not None
+                            and not self._desktop_runtime_probe(target)
+                        ):
+                            if requested:
+                                recovery_waiting = True
+                            report["skipped"].append(
+                                {
+                                    "thread_id": thread_id,
+                                    "reason": (
+                                        "desktop_shared_runtime_not_active"
+                                    ),
+                                    "stage": "pre_mutation",
+                                }
+                            )
+                            continue
 
                         assert isinstance(fresh_goal, dict)
                         reactivated_goal = client.reactivate_goal(thread_id)
@@ -1330,14 +1370,18 @@ class RecoveryEngine:
 
     @staticmethod
     def _default_client(target: TargetConfig) -> AppServerClient:
+        command = target.command
+        if target.app_server_url is None:
+            command = command + ("app-server", "--listen", "stdio://")
         return AppServerClient(
-            command=target.command + ("app-server", "--listen", "stdio://"),
+            command=command,
             codex_home=target.codex_home,
             timeout_seconds=(
                 120
                 if target.recovery_mode == "desktop_goal_state"
                 else 15
             ),
+            websocket_url=target.app_server_url,
         )
 
     def _wait_until_settled(

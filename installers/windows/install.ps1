@@ -12,6 +12,8 @@ param(
     [string[]]$DesktopThreadId = @(),
     [string]$WslDistro = "Ubuntu-22.04",
     [string]$WslUser = "",
+    [ValidateRange(1024, 65535)]
+    [int]$AppServerPort = 47831,
     [ValidateRange(5, 300)]
     [int]$WatchIntervalSeconds = 15,
     [ValidateRange(0, 1440)]
@@ -24,12 +26,15 @@ $ErrorActionPreference = "Stop"
 $TaskWindows = "CodexGoalGuardian-Windows"
 $TaskWsl = "CodexGoalGuardian-WSL"
 $TaskWatchdog = "CodexGoalGuardian-Watchdog"
+$TaskAppServer = "CodexGoalGuardian-AppServer"
 $SourceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $InstallRoot = Join-Path $env:LOCALAPPDATA "CodexGoalGuardian"
 $RuntimeRoot = Join-Path $InstallRoot "runtime"
 $ConfigPath = Join-Path $InstallRoot "config.json"
 $StatePath = Join-Path $InstallRoot "state.json"
 $LogPath = Join-Path $InstallRoot "guardian.jsonl"
+$EnvironmentBackupPath = Join-Path $InstallRoot "desktop-environment-backup.json"
+$SharedAppServerUrl = "ws://127.0.0.1:$AppServerPort/rpc"
 
 if (-not $SkipWslTask -and [string]::IsNullOrWhiteSpace($WslUser)) {
     throw "Pass -WslUser with the native Linux user for $WslDistro."
@@ -101,6 +106,9 @@ function Update-GuardianConfig {
         Set-JsonProperty $Desktop "recovery_mode" "desktop_goal_state"
         Set-JsonProperty $Desktop "allowed_sources" @("vscode")
         Set-JsonProperty $Desktop "max_thread_age_seconds" 2592000
+        Set-JsonProperty $Desktop "app_server_url" (
+            $DesktopTarget["app_server_url"]
+        )
         if ($ReplaceDesktopThreadIds) {
             Set-JsonProperty $Desktop "desktop_thread_ids" @(
                 $DesktopTarget["desktop_thread_ids"]
@@ -164,6 +172,76 @@ function Update-GuardianConfig {
     Write-Plan "migrated update-safe desktop Goal recovery in $Path"
 }
 
+function Publish-EnvironmentChange {
+    if ($null -eq ("GuardianNativeMethods" -as [type])) {
+        Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class GuardianNativeMethods {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr SendMessageTimeout(
+        IntPtr hWnd,
+        uint Msg,
+        UIntPtr wParam,
+        string lParam,
+        uint fuFlags,
+        uint uTimeout,
+        out UIntPtr lpdwResult
+    );
+}
+'@
+    }
+    $Result = [UIntPtr]::Zero
+    $null = [GuardianNativeMethods]::SendMessageTimeout(
+        [IntPtr]0xffff,
+        0x001A,
+        [UIntPtr]::Zero,
+        "Environment",
+        0x0002,
+        5000,
+        [ref]$Result
+    )
+}
+
+function Set-DesktopAppServerEnvironment {
+    param(
+        [string]$BackupPath,
+        [string]$Url
+    )
+
+    $ForceCli = [Environment]::GetEnvironmentVariable(
+        "CODEX_APP_SERVER_FORCE_CLI",
+        [EnvironmentVariableTarget]::User
+    )
+    if ($ForceCli -eq "1") {
+        throw (
+            "CODEX_APP_SERVER_FORCE_CLI=1 disables the Desktop WebSocket " +
+            "transport. Remove that user environment override first."
+        )
+    }
+    if (-not (Test-Path -LiteralPath $BackupPath)) {
+        $Previous = [Environment]::GetEnvironmentVariable(
+            "CODEX_APP_SERVER_WS_URL",
+            [EnvironmentVariableTarget]::User
+        )
+        $Backup = [ordered]@{
+            schema_version = 1
+            variable = "CODEX_APP_SERVER_WS_URL"
+            present = $null -ne $Previous
+            value = $Previous
+        }
+        $Backup | ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath $BackupPath -Encoding UTF8
+    }
+    [Environment]::SetEnvironmentVariable(
+        "CODEX_APP_SERVER_WS_URL",
+        $Url,
+        [EnvironmentVariableTarget]::User
+    )
+    Publish-EnvironmentChange
+    Write-Plan "configured Desktop shared AppServer at $Url"
+}
+
 function Resolve-NativeCodex {
     if ($CodexCommand) {
         if (Test-Path -LiteralPath $CodexCommand -PathType Leaf) {
@@ -194,7 +272,10 @@ function Resolve-NativePython {
 }
 
 function Test-WindowsRecoveryProcess {
-    param([string[]]$Command)
+    param(
+        [string[]]$Command,
+        [string]$SharedUrl
+    )
 
     foreach ($Process in @(Get-CimInstance Win32_Process)) {
         if ($Process.ProcessId -eq $PID -or
@@ -205,6 +286,15 @@ function Test-WindowsRecoveryProcess {
                 "app-server",
                 [StringComparison]::OrdinalIgnoreCase
             ) -lt 0) {
+            continue
+        }
+        if (
+            -not [string]::IsNullOrWhiteSpace($SharedUrl) -and
+            $Process.CommandLine.IndexOf(
+                $SharedUrl,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -ge 0
+        ) {
             continue
         }
 
@@ -271,6 +361,7 @@ function Wait-GuardianRecoveryDrain {
         [string[]]$WindowsCommand,
         [string]$Distro,
         [string]$LinuxUser,
+        [string]$SharedUrl,
         [switch]$SkipWsl,
         [int]$TimeoutMinutes
     )
@@ -281,7 +372,8 @@ function Wait-GuardianRecoveryDrain {
     $ProbeFailureAnnounced = $false
 
     while ($true) {
-        $WindowsActive = Test-WindowsRecoveryProcess -Command $WindowsCommand
+        $WindowsActive = Test-WindowsRecoveryProcess `
+            -Command $WindowsCommand -SharedUrl $SharedUrl
         $WslActive = $false
         if (-not $SkipWsl) {
             try {
@@ -443,6 +535,7 @@ $DesktopGoalStateTarget = [ordered]@{
     name = "windows-desktop-goal-state"
     command = @($GuardianCommand)
     codex_home = (Join-Path $env:USERPROFILE ".codex")
+    app_server_url = $SharedAppServerUrl
     recovery_mode = "desktop_goal_state"
     allowed_sources = @("vscode")
     max_thread_age_seconds = 2592000
@@ -483,7 +576,9 @@ $Configuration = [ordered]@{
 if ($DryRun) {
     Write-Plan "dry-run: copy runtime to $RuntimeRoot"
     Write-Plan "dry-run: write configuration to $ConfigPath"
+    Write-Plan "dry-run: set CODEX_APP_SERVER_WS_URL=$SharedAppServerUrl"
     if (-not $SkipTasks) {
+        Write-Plan "dry-run: register $TaskAppServer"
         Write-Plan "dry-run: register $TaskWindows"
         if (-not $SkipWslTask) {
             Write-Plan "dry-run: register $TaskWsl for $WslDistro"
@@ -495,6 +590,7 @@ if ($DryRun) {
 
 Wait-GuardianRecoveryDrain -WindowsCommand $GuardianCommand `
     -Distro $WslDistro -LinuxUser $WslUser `
+    -SharedUrl $SharedAppServerUrl `
     -SkipWsl:$SkipWslTask -TimeoutMinutes $DrainTimeoutMinutes
 
 foreach ($OwnedTask in @($TaskWatchdog, $TaskWindows, $TaskWsl)) {
@@ -523,6 +619,8 @@ if ($ForceConfig -or -not (Test-Path -LiteralPath $ConfigPath)) {
         -DesktopTarget $DesktopGoalStateTarget `
         -ReplaceDesktopThreadIds $ReplaceDesktopThreadIds
 }
+Set-DesktopAppServerEnvironment `
+    -BackupPath $EnvironmentBackupPath -Url $SharedAppServerUrl
 
 if (-not $SkipTasks) {
     $PowerShellPath = (Get-Command "powershell.exe" -ErrorAction Stop).Source
@@ -536,6 +634,38 @@ if (-not $SkipTasks) {
     $WatcherSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+    $QuoteArgument = {
+        param([string]$Value)
+        '"' + $Value.Replace('"', '\"') + '"'
+    }
+    $AppServerChildArguments = @(
+        $GuardianExecutable
+    ) + @($GuardianBaseArguments) + @(
+        "app-server",
+        "--listen",
+        $SharedAppServerUrl
+    )
+    $AppServerArguments = (
+        (& $QuoteArgument $LauncherPath) +
+        " --windows-hidden-child " +
+        (
+            @(
+                $AppServerChildArguments | ForEach-Object {
+                    & $QuoteArgument $_
+                }
+            ) -join " "
+        )
+    )
+    $AppServerAction = New-ScheduledTaskAction -Execute $PythonwPath `
+        -Argument $AppServerArguments -WorkingDirectory $RuntimeRoot
+    Register-ScheduledTask -TaskName $TaskAppServer `
+        -Action $AppServerAction -Trigger $LogonTrigger `
+        -Settings $WatcherSettings `
+        -Description "Host the shared loopback AppServer used by Codex Desktop and Goal Guardian." `
+        -Force | Out-Null
+    Write-Plan "registered $TaskAppServer"
+
     Register-ScheduledTask -TaskName $TaskWindows -Action $NativeAction `
         -Trigger $LogonTrigger -Settings $WatcherSettings `
         -Description "Resume eligible active Codex Goals after network recovery." `
@@ -573,6 +703,47 @@ if (-not $SkipTasks) {
         -Force | Out-Null
     Write-Plan "registered $TaskWatchdog"
 
+    Start-ScheduledTask -TaskName $TaskAppServer
+    $ListenerReady = $false
+    foreach ($Attempt in 1..50) {
+        $Listeners = @(
+            Get-NetTCPConnection -LocalAddress "127.0.0.1" `
+                -LocalPort $AppServerPort -State Listen `
+                -ErrorAction SilentlyContinue
+        )
+        foreach ($Listener in $Listeners) {
+            $Owner = Get-CimInstance Win32_Process `
+                -Filter "ProcessId=$($Listener.OwningProcess)"
+            if (
+                $null -ne $Owner -and
+                -not [string]::IsNullOrWhiteSpace($Owner.CommandLine) -and
+                $Owner.CommandLine.IndexOf(
+                    "app-server",
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -ge 0 -and
+                $Owner.CommandLine.IndexOf(
+                    $SharedAppServerUrl,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -ge 0
+            ) {
+                $ListenerReady = $true
+                break
+            }
+        }
+        if ($ListenerReady) {
+            break
+        }
+        if ($Listeners.Count -gt 0) {
+            throw (
+                "Port $AppServerPort is owned by a different process; " +
+                "shared AppServer was not started."
+            )
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $ListenerReady) {
+        throw "Shared AppServer did not listen at $SharedAppServerUrl."
+    }
     Start-ScheduledTask -TaskName $TaskWindows
     if (-not $SkipWslTask) {
         Start-ScheduledTask -TaskName $TaskWsl

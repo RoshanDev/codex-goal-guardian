@@ -6,7 +6,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$TaskNames = @("CodexGoalGuardian-Windows")
+$TaskNames = @(
+    "CodexGoalGuardian-AppServer",
+    "CodexGoalGuardian-Windows"
+)
 if (-not $SkipWsl) {
     $TaskNames += "CodexGoalGuardian-WSL"
 }
