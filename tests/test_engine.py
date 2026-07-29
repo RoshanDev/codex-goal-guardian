@@ -1192,6 +1192,86 @@ class RecoveryEngineTests(unittest.TestCase):
             ["desktop_turn_started", "desktop_turn_settled"],
         )
 
+    def test_shared_runtime_rearms_a_split_runtime_record(self) -> None:
+        desktop_target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            app_server_url="ws://127.0.0.1:47831/rpc",
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=100,
+            resume_grace_seconds=0,
+            start_recovery_turn=True,
+            desktop_thread_ids=("thread-1",),
+        )
+        state = self.store.load()
+        mark_desktop_direct_recovery(
+            state,
+            desktop_target.name,
+            "thread-1",
+            turn_id="turn-1",
+            action="runtime_active",
+            recovery_turn_id="turn-old-split-runtime",
+            now=115,
+        )
+        self.store.save(state)
+        desktop = make_thread(source="vscode")
+        active_goal = {
+            "threadId": "thread-1",
+            "objective": "finish safely",
+            "status": "active",
+            "tokenBudget": 40_000,
+            "tokensUsed": 1234,
+            "timeUsedSeconds": 5678,
+            "createdAt": 90,
+            "updatedAt": 111,
+        }
+        client = _FakeClient(
+            listed_thread=desktop,
+            read_sequence=[
+                desktop,
+                desktop,
+                desktop,
+                desktop,
+                desktop,
+            ],
+            goal=active_goal,
+        )
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(desktop_target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: False,
+            desktop_runtime_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(client.resume_calls, 1)
+        self.assertEqual(client.start_calls, 1)
+        self.assertEqual(
+            [action["action"] for action in report["targets"][0]["actions"]],
+            ["desktop_turn_started", "desktop_turn_settled"],
+        )
+        record = desktop_direct_recovery_record(
+            self.store.load(),
+            desktop_target.name,
+            "thread-1",
+        )
+        self.assertEqual(
+            record["app_server_url"],
+            desktop_target.app_server_url,
+        )
+
     def test_desktop_direct_watch_follows_turn_started_by_resume(
         self,
     ) -> None:

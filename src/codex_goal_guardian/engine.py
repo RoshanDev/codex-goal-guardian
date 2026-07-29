@@ -392,6 +392,8 @@ class RecoveryEngine:
                         if (
                             target.start_recovery_turn
                             and isinstance(direct_record, dict)
+                            and direct_record.get("app_server_url")
+                            == target.app_server_url
                             and direct_record.get("action")
                             in _PENDING_DESKTOP_WAKE_ACTIONS
                             and direct_record.get("turn_id")
@@ -439,6 +441,8 @@ class RecoveryEngine:
                                         not isinstance(record, dict)
                                         or record.get("turn_id")
                                         != evidence_turn_id
+                                        or record.get("app_server_url")
+                                        != target.app_server_url
                                         or record.get("action")
                                         not in wake_finished
                                     )
@@ -559,6 +563,8 @@ class RecoveryEngine:
                             if (
                                 isinstance(record, dict)
                                 and record.get("turn_id") == candidate_id
+                                and record.get("app_server_url")
+                                == target.app_server_url
                                 and (
                                     not target.start_recovery_turn
                                     or record.get("action")
@@ -694,6 +700,8 @@ class RecoveryEngine:
                                 isinstance(fresh_record, dict)
                                 and fresh_record.get("turn_id")
                                 == fresh_candidate_id
+                                and fresh_record.get("app_server_url")
+                                == target.app_server_url
                                 and (
                                     not target.start_recovery_turn
                                     or fresh_record.get("action")
@@ -755,6 +763,7 @@ class RecoveryEngine:
                                 target.name,
                                 thread_id,
                                 turn_id=fresh_candidate_id,
+                                app_server_url=target.app_server_url,
                                 now=now,
                             )
                         store.save(state)
@@ -819,6 +828,7 @@ class RecoveryEngine:
             thread_id,
             turn_id=evidence_turn_id,
             action="goal_state_reactivated",
+            app_server_url=target.app_server_url,
             now=now,
         )
         store.save(state)
@@ -837,6 +847,7 @@ class RecoveryEngine:
                 thread_id,
                 turn_id=evidence_turn_id,
                 action="goal_changed",
+                app_server_url=target.app_server_url,
                 now=now,
             )
             store.save(state)
@@ -855,6 +866,7 @@ class RecoveryEngine:
                 thread_id,
                 turn_id=evidence_turn_id,
                 action="runtime_active",
+                app_server_url=target.app_server_url,
                 now=now,
             )
             store.save(state)
@@ -873,6 +885,7 @@ class RecoveryEngine:
             thread_id,
             turn_id=evidence_turn_id,
             action="resume_requested",
+            app_server_url=target.app_server_url,
             now=now,
         )
         store.save(state)
@@ -892,6 +905,7 @@ class RecoveryEngine:
                     thread_id,
                     turn_id=evidence_turn_id,
                     action="goal_changed",
+                    app_server_url=target.app_server_url,
                     now=now,
                 )
                 store.save(state)
@@ -912,6 +926,7 @@ class RecoveryEngine:
                     turn_id=evidence_turn_id,
                     action="runtime_active",
                     recovery_turn_id=recovery_turn_id,
+                    app_server_url=target.app_server_url,
                     now=now,
                 )
                 store.save(state)
@@ -935,6 +950,7 @@ class RecoveryEngine:
                     turn_id=evidence_turn_id,
                     action="turn_settled",
                     recovery_turn_id=recovery_turn_id,
+                    app_server_url=target.app_server_url,
                     now=now,
                 )
                 store.save(state)
@@ -976,6 +992,7 @@ class RecoveryEngine:
             turn_id=evidence_turn_id,
             action="turn_started",
             recovery_turn_id=normalized_recovery_turn_id,
+            app_server_url=target.app_server_url,
             now=now,
         )
         store.save(state)
@@ -1001,6 +1018,7 @@ class RecoveryEngine:
             turn_id=evidence_turn_id,
             action="turn_settled",
             recovery_turn_id=normalized_recovery_turn_id,
+            app_server_url=target.app_server_url,
             now=now,
         )
         store.save(state)

@@ -273,6 +273,7 @@ def mark_desktop_direct_recovery(
     turn_id: str,
     action: str = "goal_state_reactivated",
     recovery_turn_id: str | None = None,
+    app_server_url: str | None = None,
     now: int | None = None,
 ) -> None:
     records = _target_state(state, target_name)["desktop_direct_recoveries"]
@@ -284,6 +285,7 @@ def mark_desktop_direct_recovery(
         "turn_id": turn_id,
         "action": action,
         "recovery_turn_id": recovery_turn_id,
+        "app_server_url": app_server_url,
         "recorded_at": int(time.time() if now is None else now),
     }
 
