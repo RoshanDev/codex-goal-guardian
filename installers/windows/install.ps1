@@ -9,6 +9,7 @@ param(
     [string]$ProxyUrl = "",
     [string]$TcpHost = "",
     [int]$TcpPort = 0,
+    [string[]]$DesktopThreadId = @(),
     [string]$WslDistro = "Ubuntu-22.04",
     [string]$WslUser = "",
     [ValidateRange(5, 300)]
@@ -34,6 +35,23 @@ if (-not $SkipWslTask -and [string]::IsNullOrWhiteSpace($WslUser)) {
     throw "Pass -WslUser with the native Linux user for $WslDistro."
 }
 
+$ReplaceDesktopThreadIds = $PSBoundParameters.ContainsKey("DesktopThreadId")
+$DesktopThreadIds = @(
+    foreach ($Value in $DesktopThreadId) {
+        $Normalized = $Value.Trim()
+        if (
+            [string]::IsNullOrWhiteSpace($Normalized) -or
+            $Normalized.Length -gt 128
+        ) {
+            throw "DesktopThreadId values must be non-empty and at most 128 characters."
+        }
+        $Normalized
+    }
+)
+if (@($DesktopThreadIds | Select-Object -Unique).Count -ne $DesktopThreadIds.Count) {
+    throw "DesktopThreadId values must be unique."
+}
+
 function Write-Plan {
     param([string]$Message)
     Write-Host "[Codex Goal Guardian] $Message"
@@ -56,7 +74,8 @@ function Set-JsonProperty {
 function Update-GuardianConfig {
     param(
         [string]$Path,
-        [System.Collections.IDictionary]$DesktopTarget
+        [System.Collections.IDictionary]$DesktopTarget,
+        [bool]$ReplaceDesktopThreadIds
     )
 
     $Existing = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
@@ -82,8 +101,17 @@ function Update-GuardianConfig {
         Set-JsonProperty $Desktop "recovery_mode" "desktop_goal_state"
         Set-JsonProperty $Desktop "allowed_sources" @("vscode")
         Set-JsonProperty $Desktop "max_thread_age_seconds" 2592000
-        Set-JsonProperty $Desktop "resume_grace_seconds" 0
-        Set-JsonProperty $Desktop "start_recovery_turn" $false
+        if ($ReplaceDesktopThreadIds) {
+            Set-JsonProperty $Desktop "desktop_thread_ids" @(
+                $DesktopTarget["desktop_thread_ids"]
+            )
+            Set-JsonProperty $Desktop "resume_grace_seconds" (
+                $DesktopTarget["resume_grace_seconds"]
+            )
+            Set-JsonProperty $Desktop "start_recovery_turn" (
+                $DesktopTarget["start_recovery_turn"]
+            )
+        }
     }
 
     $WindowsTargets = @(
@@ -410,6 +438,7 @@ Write-Plan "verified windowless Python via $PythonwPath"
 $ProxyValue = if ($ProxyUrl) { $ProxyUrl } else { $null }
 $TcpHostValue = if ($TcpHost) { $TcpHost } else { $null }
 $TcpPortValue = if ($TcpPort -gt 0) { $TcpPort } else { $null }
+$DesktopWakeEnabled = $DesktopThreadIds.Count -gt 0
 $DesktopGoalStateTarget = [ordered]@{
     name = "windows-desktop-goal-state"
     command = @($GuardianCommand)
@@ -418,8 +447,9 @@ $DesktopGoalStateTarget = [ordered]@{
     allowed_sources = @("vscode")
     max_thread_age_seconds = 2592000
     thread_limit = 50
-    resume_grace_seconds = 0
-    start_recovery_turn = $false
+    resume_grace_seconds = if ($DesktopWakeEnabled) { 2 } else { 0 }
+    start_recovery_turn = $DesktopWakeEnabled
+    desktop_thread_ids = @($DesktopThreadIds)
 }
 $Configuration = [ordered]@{
     schema_version = 1
@@ -490,7 +520,8 @@ if ($ForceConfig -or -not (Test-Path -LiteralPath $ConfigPath)) {
     Write-Plan "wrote $ConfigPath"
 } else {
     Update-GuardianConfig -Path $ConfigPath `
-        -DesktopTarget $DesktopGoalStateTarget
+        -DesktopTarget $DesktopGoalStateTarget `
+        -ReplaceDesktopThreadIds $ReplaceDesktopThreadIds
 }
 
 if (-not $SkipTasks) {

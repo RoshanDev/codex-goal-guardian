@@ -1,5 +1,8 @@
 # Codex Goal Guardian Implementation Plan
 
+> Historical v0.3 plan. The v0.5.1 allowlisted local Desktop watcher and
+> recovery contract in `README.md` supersede the heartbeat-first path below.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build, install, and publicly publish update-resilient desktop

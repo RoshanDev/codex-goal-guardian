@@ -37,6 +37,20 @@ class PluginPackagingTests(unittest.TestCase):
         self.assertEqual(marketplace["plugins"][0]["version"], __version__)
         self.assertEqual(manifest["version"], __version__)
 
+    def test_desktop_skill_prefers_token_free_local_watch(
+        self,
+    ) -> None:
+        skill = (
+            ROOT
+            / "plugin/codex-goal-guardian/skills/codex-goal-guardian/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("`desktop_thread_ids` allowlist", skill)
+        self.assertIn("not create model turns", skill)
+        self.assertIn("read-only session JSONL", skill)
+        self.assertIn("one deterministic `turn/start`", skill)
+        self.assertIn("generic completed-heartbeat entry", skill)
+
 
 if __name__ == "__main__":
     unittest.main()

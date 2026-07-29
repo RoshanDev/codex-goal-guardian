@@ -34,6 +34,14 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("windows-desktop-goal-state", content)
         self.assertIn('recovery_mode = "desktop_goal_state"', content)
         self.assertIn('allowed_sources = @("vscode")', content)
+        self.assertIn("[string[]]$DesktopThreadId", content)
+        self.assertIn("desktop_thread_ids", content)
+        self.assertIn("$ReplaceDesktopThreadIds", content)
+        self.assertIn("$DesktopWakeEnabled", content)
+        self.assertIn(
+            "start_recovery_turn = $DesktopWakeEnabled",
+            content,
+        )
         self.assertIn("pre-0.3.0.bak", content)
         self.assertIn("__disabled_until_guardian_upgrade__", content)
         self.assertIn("2592000", content)

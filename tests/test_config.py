@@ -67,6 +67,7 @@ class ConfigTests(unittest.TestCase):
                     "recovery_mode": "desktop_goal_state",
                     "allowed_sources": ["vscode"],
                     "start_recovery_turn": False,
+                    "desktop_thread_ids": [" thread-1 "],
                 }
             ],
         }
@@ -81,6 +82,29 @@ class ConfigTests(unittest.TestCase):
             "desktop_goal_state",
         )
         self.assertEqual(config.targets[0].allowed_sources, ("vscode",))
+        self.assertEqual(config.targets[0].desktop_thread_ids, ("thread-1",))
+
+    def test_rejects_duplicate_desktop_thread_ids(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "state_path": "state.json",
+            "log_path": "guardian.jsonl",
+            "targets": [
+                {
+                    "name": "windows-desktop-goal-state",
+                    "command": ["codex.cmd"],
+                    "codex_home": "codex-home",
+                    "recovery_mode": "desktop_goal_state",
+                    "desktop_thread_ids": ["thread-1", "thread-1"],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "desktop_thread_ids"):
+                load_config(path)
 
     def test_rejects_unknown_recovery_mode(self) -> None:
         payload = {

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import copy
+import json
+import mmap
+import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .app_server import AppServerClient, AppServerError
@@ -11,8 +15,10 @@ from .health import HealthResult, probe_health
 from .ownership import cli_process_is_running
 from .state import (
     StateStore,
+    desktop_direct_recovery_record,
     finish_desktop_recovery_request,
     is_recovery_pending,
+    mark_desktop_direct_recovery,
     mark_recovered,
     pending_desktop_recovery_requests,
     recovery_record,
@@ -38,6 +44,10 @@ _WAITING_RECOVERY_REASONS = {
     "thread_active",
     "turn_in_progress",
 }
+_PENDING_DESKTOP_WAKE_ACTIONS = {
+    "goal_state_reactivated",
+    "resume_requested",
+}
 _NETWORK_ERROR_MARKERS = (
     "connection",
     "disconnected",
@@ -54,7 +64,7 @@ _NETWORK_ERROR_MARKERS = (
 
 
 def looks_like_network_failure(thread: dict[str, Any]) -> bool:
-    turn = _recent_failed_turn(thread)
+    turn = _latest_recovery_candidate_turn(thread)
     if turn is None:
         return False
     return _turn_looks_like_network_failure(turn)
@@ -64,6 +74,10 @@ def _turn_looks_like_network_failure(turn: dict[str, Any]) -> bool:
     error = turn.get("error")
     if not isinstance(error, dict):
         return False
+    return _error_looks_like_network_failure(error)
+
+
+def _error_looks_like_network_failure(error: dict[str, Any]) -> bool:
     text = " ".join(
         str(error.get(key, ""))
         for key in ("message", "additionalDetails", "codexErrorInfo")
@@ -127,6 +141,7 @@ def desktop_goal_reactivation_eligibility(
     *,
     now: int,
     already_recovered: bool,
+    pending_evidence_turn_id: str | None = None,
 ) -> tuple[bool, str]:
     if already_recovered:
         return False, "already_recovered"
@@ -158,11 +173,19 @@ def desktop_goal_reactivation_eligibility(
         return False, "turn_missing"
     if _has_in_progress_turn(thread):
         return False, "turn_in_progress"
-    failed_turn = _recent_failed_turn(thread)
-    if failed_turn is None:
-        turn_status = str(turns[-1].get("status", "missing"))
+    candidate = _desktop_recovery_candidate_turn(
+        thread,
+        pending_evidence_turn_id=pending_evidence_turn_id,
+    )
+    if candidate is None:
+        return False, "turn_missing"
+    error = _desktop_turn_error(thread, candidate, target)
+    if error is None:
+        turn_status = str(candidate.get("status", "missing"))
+        if turn_status in {"failed", "interrupted"}:
+            return False, "turn_not_network_failure"
         return False, f"turn_{turn_status}"
-    if not looks_like_network_failure(thread):
+    if not _error_looks_like_network_failure(error):
         return False, "turn_not_network_failure"
     return True, "eligible"
 
@@ -250,11 +273,14 @@ class RecoveryEngine:
                     requests = pending_desktop_recovery_requests(
                         state, target.name
                     )
-                    if not requests:
+                    watched_thread_ids = target.desktop_thread_ids
+                    if not requests and not watched_thread_ids:
                         continue
                     complete = self._recover_desktop_requests(
                         target,
                         requests,
+                        watched_thread_ids,
+                        config.recovery_prompt,
                         state,
                         store,
                         target_report,
@@ -263,10 +289,16 @@ class RecoveryEngine:
                     )
                     if dry_run:
                         target_report["status"] = "dry_run"
-                    elif complete:
+                    elif requests and complete:
+                        target_report["status"] = "recovered"
+                    elif requests:
+                        target_report["status"] = "recovery_pending"
+                    elif target_report["errors"]:
+                        target_report["status"] = "error"
+                    elif target_report["actions"]:
                         target_report["status"] = "recovered"
                     else:
-                        target_report["status"] = "recovery_pending"
+                        target_report["status"] = "monitoring"
                     continue
 
                 if transition.recover_now:
@@ -312,6 +344,8 @@ class RecoveryEngine:
         self,
         target: TargetConfig,
         requests: dict[str, dict[str, Any]],
+        watched_thread_ids: tuple[str, ...],
+        recovery_prompt: str,
         state: dict[str, Any],
         store: StateStore,
         report: dict[str, Any],
@@ -324,8 +358,39 @@ class RecoveryEngine:
         try:
             client_context = self._client_factory(target)
             with client_context as client:
-                for thread_id, request in requests.items():
-                    generation = int(request.get("generation", -1))
+                thread_ids = tuple(
+                    dict.fromkeys((*requests, *watched_thread_ids))
+                )
+                watched = set(watched_thread_ids)
+                for thread_id in thread_ids:
+                    request = requests.get(thread_id)
+                    requested = isinstance(request, dict)
+                    generation = (
+                        int(request.get("generation", -1))
+                        if requested
+                        else -1
+                    )
+                    direct = thread_id in watched
+                    direct_record = (
+                        desktop_direct_recovery_record(
+                            state,
+                            target.name,
+                            thread_id,
+                        )
+                        if direct
+                        else None
+                    )
+                    pending_evidence_turn_id = (
+                        str(direct_record.get("turn_id"))
+                        if (
+                            target.start_recovery_turn
+                            and isinstance(direct_record, dict)
+                            and direct_record.get("action")
+                            in _PENDING_DESKTOP_WAKE_ACTIONS
+                            and direct_record.get("turn_id")
+                        )
+                        else None
+                    )
                     try:
                         thread = client.read_thread(
                             thread_id, include_turns=True
@@ -336,7 +401,68 @@ class RecoveryEngine:
                             isinstance(goal, dict)
                             and goal.get("status") == "active"
                         ):
-                            if not dry_run:
+                            if (
+                                direct
+                                and target.start_recovery_turn
+                                and not _thread_or_turn_active(thread)
+                            ):
+                                evidence_turn_id = (
+                                    _desktop_network_failure_turn_id(
+                                        thread,
+                                        target,
+                                        pending_evidence_turn_id=(
+                                            pending_evidence_turn_id
+                                        ),
+                                    )
+                                )
+                                record = desktop_direct_recovery_record(
+                                    state,
+                                    target.name,
+                                    thread_id,
+                                )
+                                wake_finished = {
+                                    "runtime_active",
+                                    "turn_started",
+                                    "turn_settled",
+                                    "goal_changed",
+                                }
+                                wake_pending = (
+                                    isinstance(evidence_turn_id, str)
+                                    and (
+                                        not isinstance(record, dict)
+                                        or record.get("turn_id")
+                                        != evidence_turn_id
+                                        or record.get("action")
+                                        not in wake_finished
+                                    )
+                                )
+                                if wake_pending:
+                                    if dry_run:
+                                        report["actions"].append(
+                                            {
+                                                "thread_id": thread_id,
+                                                "action": (
+                                                    "would_wake_active_goal"
+                                                ),
+                                                "mode": "direct",
+                                                "evidence_turn_id": (
+                                                    evidence_turn_id
+                                                ),
+                                            }
+                                        )
+                                    else:
+                                        self._wake_direct_desktop_goal(
+                                            client,
+                                            target,
+                                            thread_id,
+                                            evidence_turn_id,
+                                            recovery_prompt,
+                                            state,
+                                            store,
+                                            report,
+                                            now,
+                                        )
+                            if requested and not dry_run:
                                 finish_desktop_recovery_request(
                                     state,
                                     target.name,
@@ -346,13 +472,17 @@ class RecoveryEngine:
                                     now=now,
                                 )
                                 store.save(state)
-                            report["actions"].append(
-                                {
-                                    "thread_id": thread_id,
-                                    "action": "goal_already_active",
-                                    "same_runtime_wake_required": True,
-                                }
-                            )
+                            if requested:
+                                report["actions"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "action": "goal_already_active",
+                                        "same_runtime_wake_required": not (
+                                            direct
+                                            and target.start_recovery_turn
+                                        ),
+                                    }
+                                )
                             continue
 
                         eligible, reason = (
@@ -362,12 +492,18 @@ class RecoveryEngine:
                                 target,
                                 now=now,
                                 already_recovered=False,
+                                pending_evidence_turn_id=(
+                                    pending_evidence_turn_id
+                                ),
                             )
                         )
                         if not eligible:
-                            if reason in _WAITING_RECOVERY_REASONS:
+                            if (
+                                requested
+                                and reason in _WAITING_RECOVERY_REASONS
+                            ):
                                 recovery_waiting = True
-                            elif not dry_run:
+                            elif requested and not dry_run:
                                 finish_desktop_recovery_request(
                                     state,
                                     target.name,
@@ -385,15 +521,76 @@ class RecoveryEngine:
                             )
                             continue
 
-                        if dry_run:
-                            report["actions"].append(
+                        candidate = _desktop_recovery_candidate_turn(
+                            thread,
+                            pending_evidence_turn_id=(
+                                pending_evidence_turn_id
+                            ),
+                        )
+                        candidate_id = (
+                            candidate.get("id")
+                            if isinstance(candidate, dict)
+                            else None
+                        )
+                        if direct and (
+                            not isinstance(candidate_id, str)
+                            or not candidate_id
+                        ):
+                            report["skipped"].append(
                                 {
                                     "thread_id": thread_id,
-                                    "action": "would_reactivate_goal",
-                                    "network_failure": True,
-                                    "same_runtime_wake_required": True,
+                                    "reason": "turn_id_missing",
                                 }
                             )
+                            continue
+                        if direct:
+                            record = desktop_direct_recovery_record(
+                                state,
+                                target.name,
+                                thread_id,
+                            )
+                            if (
+                                isinstance(record, dict)
+                                and record.get("turn_id") == candidate_id
+                                and (
+                                    not target.start_recovery_turn
+                                    or record.get("action")
+                                    not in _PENDING_DESKTOP_WAKE_ACTIONS
+                                )
+                            ):
+                                if requested and not dry_run:
+                                    finish_desktop_recovery_request(
+                                        state,
+                                        target.name,
+                                        thread_id,
+                                        expected_generation=generation,
+                                        action=(
+                                            "request_skipped_"
+                                            "already_recovered_turn"
+                                        ),
+                                        now=now,
+                                    )
+                                    store.save(state)
+                                report["skipped"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "reason": "already_recovered_turn",
+                                    }
+                                )
+                                continue
+
+                        if dry_run:
+                            action = {
+                                "thread_id": thread_id,
+                                "action": "would_reactivate_goal",
+                                "network_failure": True,
+                                "same_runtime_wake_required": not (
+                                    direct and target.start_recovery_turn
+                                ),
+                            }
+                            if direct:
+                                action["mode"] = "direct"
+                            report["actions"].append(action)
                             continue
 
                         fresh_thread = client.read_thread(
@@ -407,12 +604,19 @@ class RecoveryEngine:
                                 target,
                                 now=now,
                                 already_recovered=False,
+                                pending_evidence_turn_id=(
+                                    pending_evidence_turn_id
+                                ),
                             )
                         )
                         if not fresh_eligible:
-                            if fresh_reason in _WAITING_RECOVERY_REASONS:
+                            if (
+                                requested
+                                and fresh_reason
+                                in _WAITING_RECOVERY_REASONS
+                            ):
                                 recovery_waiting = True
-                            else:
+                            elif requested:
                                 finish_desktop_recovery_request(
                                     state,
                                     target.name,
@@ -434,6 +638,54 @@ class RecoveryEngine:
                             )
                             continue
 
+                        fresh_candidate = _desktop_recovery_candidate_turn(
+                            fresh_thread,
+                            pending_evidence_turn_id=(
+                                pending_evidence_turn_id
+                            ),
+                        )
+                        fresh_candidate_id = (
+                            fresh_candidate.get("id")
+                            if isinstance(fresh_candidate, dict)
+                            else None
+                        )
+                        if direct and (
+                            not isinstance(fresh_candidate_id, str)
+                            or not fresh_candidate_id
+                        ):
+                            report["skipped"].append(
+                                {
+                                    "thread_id": thread_id,
+                                    "reason": "turn_id_missing",
+                                    "stage": "pre_mutation",
+                                }
+                            )
+                            continue
+                        if direct:
+                            fresh_record = desktop_direct_recovery_record(
+                                state,
+                                target.name,
+                                thread_id,
+                            )
+                            if (
+                                isinstance(fresh_record, dict)
+                                and fresh_record.get("turn_id")
+                                == fresh_candidate_id
+                                and (
+                                    not target.start_recovery_turn
+                                    or fresh_record.get("action")
+                                    not in _PENDING_DESKTOP_WAKE_ACTIONS
+                                )
+                            ):
+                                report["skipped"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "reason": "already_recovered_turn",
+                                        "stage": "pre_mutation",
+                                    }
+                                )
+                                continue
+
                         assert isinstance(fresh_goal, dict)
                         reactivated_goal = client.reactivate_goal(thread_id)
                         _verify_goal_reactivation(
@@ -447,26 +699,53 @@ class RecoveryEngine:
                         _verify_goal_reactivation(
                             fresh_goal, confirmed_goal
                         )
-                        finish_desktop_recovery_request(
-                            state,
-                            target.name,
-                            thread_id,
-                            expected_generation=generation,
-                            action="goal_state_reactivated",
-                            now=now,
-                        )
+                        if requested:
+                            finish_desktop_recovery_request(
+                                state,
+                                target.name,
+                                thread_id,
+                                expected_generation=generation,
+                                action="goal_state_reactivated",
+                                now=now,
+                            )
+                        if direct:
+                            assert isinstance(fresh_candidate_id, str)
+                            mark_desktop_direct_recovery(
+                                state,
+                                target.name,
+                                thread_id,
+                                turn_id=fresh_candidate_id,
+                                now=now,
+                            )
                         store.save(state)
-                        report["actions"].append(
-                            {
-                                "thread_id": thread_id,
-                                "action": "goal_state_reactivated",
-                                "tokens_used": confirmed_goal.get("tokensUsed"),
-                                "time_used_seconds": confirmed_goal.get(
-                                    "timeUsedSeconds"
-                                ),
-                                "same_runtime_wake_required": True,
-                            }
-                        )
+                        action = {
+                            "thread_id": thread_id,
+                            "action": "goal_state_reactivated",
+                            "tokens_used": confirmed_goal.get("tokensUsed"),
+                            "time_used_seconds": confirmed_goal.get(
+                                "timeUsedSeconds"
+                            ),
+                            "same_runtime_wake_required": not (
+                                direct and target.start_recovery_turn
+                            ),
+                        }
+                        if direct:
+                            action["mode"] = "direct"
+                            action["evidence_turn_id"] = fresh_candidate_id
+                        report["actions"].append(action)
+                        if direct and target.start_recovery_turn:
+                            assert isinstance(fresh_candidate_id, str)
+                            self._wake_direct_desktop_goal(
+                                client,
+                                target,
+                                thread_id,
+                                fresh_candidate_id,
+                                recovery_prompt,
+                                state,
+                                store,
+                                report,
+                                now,
+                            )
                     except Exception as error:
                         had_error = True
                         report["errors"].append(
@@ -481,6 +760,223 @@ class RecoveryEngine:
             )
             return False
         return not had_error and not recovery_waiting
+
+    def _wake_direct_desktop_goal(
+        self,
+        client: Any,
+        target: TargetConfig,
+        thread_id: str,
+        evidence_turn_id: str,
+        recovery_prompt: str,
+        state: dict[str, Any],
+        store: StateStore,
+        report: dict[str, Any],
+        now: int,
+    ) -> None:
+        mark_desktop_direct_recovery(
+            state,
+            target.name,
+            thread_id,
+            turn_id=evidence_turn_id,
+            action="goal_state_reactivated",
+            now=now,
+        )
+        store.save(state)
+
+        if target.resume_grace_seconds > 0:
+            self._sleep(target.resume_grace_seconds)
+        before_resume = client.read_thread(thread_id, include_turns=True)
+        goal_before_resume = client.get_goal(thread_id)
+        if (
+            not isinstance(goal_before_resume, dict)
+            or goal_before_resume.get("status") != "active"
+        ):
+            mark_desktop_direct_recovery(
+                state,
+                target.name,
+                thread_id,
+                turn_id=evidence_turn_id,
+                action="goal_changed",
+                now=now,
+            )
+            store.save(state)
+            report["actions"].append(
+                {
+                    "thread_id": thread_id,
+                    "action": "goal_changed_before_wake",
+                    "mode": "direct",
+                }
+            )
+            return
+        if _thread_or_turn_active(before_resume):
+            mark_desktop_direct_recovery(
+                state,
+                target.name,
+                thread_id,
+                turn_id=evidence_turn_id,
+                action="runtime_active",
+                now=now,
+            )
+            store.save(state)
+            report["actions"].append(
+                {
+                    "thread_id": thread_id,
+                    "action": "desktop_runtime_already_active",
+                    "mode": "direct",
+                }
+            )
+            return
+
+        mark_desktop_direct_recovery(
+            state,
+            target.name,
+            thread_id,
+            turn_id=evidence_turn_id,
+            action="resume_requested",
+            now=now,
+        )
+        store.save(state)
+        client.resume_thread(thread_id)
+        for _ in range(2):
+            if target.resume_grace_seconds > 0:
+                self._sleep(target.resume_grace_seconds)
+            wake_thread = client.read_thread(thread_id, include_turns=True)
+            wake_goal = client.get_goal(thread_id)
+            if (
+                not isinstance(wake_goal, dict)
+                or wake_goal.get("status") != "active"
+            ):
+                mark_desktop_direct_recovery(
+                    state,
+                    target.name,
+                    thread_id,
+                    turn_id=evidence_turn_id,
+                    action="goal_changed",
+                    now=now,
+                )
+                store.save(state)
+                report["actions"].append(
+                    {
+                        "thread_id": thread_id,
+                        "action": "goal_changed_before_turn_start",
+                        "mode": "direct",
+                    }
+                )
+                return
+            if _thread_or_turn_active(wake_thread):
+                recovery_turn_id = _latest_turn_id(wake_thread)
+                mark_desktop_direct_recovery(
+                    state,
+                    target.name,
+                    thread_id,
+                    turn_id=evidence_turn_id,
+                    action="runtime_active",
+                    recovery_turn_id=recovery_turn_id,
+                    now=now,
+                )
+                store.save(state)
+                report["actions"].append(
+                    {
+                        "thread_id": thread_id,
+                        "action": "desktop_runtime_became_active",
+                        "turn_id": recovery_turn_id,
+                        "mode": "direct",
+                    }
+                )
+                _, goal_after_turn = self._wait_until_settled(
+                    client,
+                    thread_id,
+                    target,
+                )
+                mark_desktop_direct_recovery(
+                    state,
+                    target.name,
+                    thread_id,
+                    turn_id=evidence_turn_id,
+                    action="turn_settled",
+                    recovery_turn_id=recovery_turn_id,
+                    now=now,
+                )
+                store.save(state)
+                report["actions"].append(
+                    {
+                        "thread_id": thread_id,
+                        "action": "desktop_turn_settled",
+                        "turn_id": recovery_turn_id,
+                        "goal_status": (
+                            goal_after_turn.get("status")
+                            if isinstance(goal_after_turn, dict)
+                            else None
+                        ),
+                        "mode": "direct",
+                    }
+                )
+                return
+
+        message_id = _desktop_recovery_message_id(
+            target.name,
+            evidence_turn_id,
+            thread_id,
+        )
+        turn = client.start_turn(
+            thread_id,
+            prompt=recovery_prompt,
+            client_user_message_id=message_id,
+        )
+        recovery_turn_id = turn.get("id")
+        normalized_recovery_turn_id = (
+            str(recovery_turn_id)
+            if recovery_turn_id is not None
+            else None
+        )
+        mark_desktop_direct_recovery(
+            state,
+            target.name,
+            thread_id,
+            turn_id=evidence_turn_id,
+            action="turn_started",
+            recovery_turn_id=normalized_recovery_turn_id,
+            now=now,
+        )
+        store.save(state)
+        report["actions"].append(
+            {
+                "thread_id": thread_id,
+                "action": "desktop_turn_started",
+                "turn_id": recovery_turn_id,
+                "client_user_message_id": message_id,
+                "mode": "direct",
+            }
+        )
+
+        _, goal_after_turn = self._wait_until_settled(
+            client,
+            thread_id,
+            target,
+        )
+        mark_desktop_direct_recovery(
+            state,
+            target.name,
+            thread_id,
+            turn_id=evidence_turn_id,
+            action="turn_settled",
+            recovery_turn_id=normalized_recovery_turn_id,
+            now=now,
+        )
+        store.save(state)
+        report["actions"].append(
+            {
+                "thread_id": thread_id,
+                "action": "desktop_turn_settled",
+                "turn_id": recovery_turn_id,
+                "goal_status": (
+                    goal_after_turn.get("status")
+                    if isinstance(goal_after_turn, dict)
+                    else None
+                ),
+                "mode": "direct",
+            }
+        )
 
     def _recover_target(
         self,
@@ -837,7 +1333,11 @@ class RecoveryEngine:
         return AppServerClient(
             command=target.command + ("app-server", "--listen", "stdio://"),
             codex_home=target.codex_home,
-            timeout_seconds=15,
+            timeout_seconds=(
+                120
+                if target.recovery_mode == "desktop_goal_state"
+                else 15
+            ),
         )
 
     def _wait_until_settled(
@@ -880,17 +1380,208 @@ def _thread_source(thread: dict[str, Any]) -> str:
     return ""
 
 
-def _recent_failed_turn(thread: dict[str, Any]) -> dict[str, Any] | None:
+def _latest_recovery_candidate_turn(
+    thread: dict[str, Any],
+) -> dict[str, Any] | None:
     turns = thread.get("turns")
     if not isinstance(turns, list):
         return None
-    for turn in reversed(turns[-12:]):
-        if (
-            isinstance(turn, dict)
-            and turn.get("status") in {"failed", "interrupted"}
-        ):
+    for turn in reversed(turns):
+        if isinstance(turn, dict) and not _is_guardian_heartbeat_turn(turn):
             return turn
     return None
+
+
+def _desktop_recovery_candidate_turn(
+    thread: dict[str, Any],
+    *,
+    pending_evidence_turn_id: str | None,
+) -> dict[str, Any] | None:
+    latest = _latest_recovery_candidate_turn(thread)
+    if (
+        not pending_evidence_turn_id
+        or not isinstance(latest, dict)
+        or latest.get("id") == pending_evidence_turn_id
+    ):
+        return latest
+
+    turns = thread.get("turns")
+    if not isinstance(turns, list):
+        return latest
+    evidence_index = next(
+        (
+            index
+            for index, turn in enumerate(turns)
+            if (
+                isinstance(turn, dict)
+                and turn.get("id") == pending_evidence_turn_id
+            )
+        ),
+        None,
+    )
+    if evidence_index is None:
+        return latest
+    evidence = turns[evidence_index]
+    for later in turns[evidence_index + 1 :]:
+        if not isinstance(later, dict) or _is_guardian_heartbeat_turn(later):
+            continue
+        if not _is_empty_interrupted_turn(later):
+            return latest
+    return evidence if isinstance(evidence, dict) else latest
+
+
+def _is_empty_interrupted_turn(turn: dict[str, Any]) -> bool:
+    items = turn.get("items")
+    return (
+        turn.get("status") == "interrupted"
+        and isinstance(items, list)
+        and not items
+    )
+
+
+def _is_guardian_heartbeat_turn(turn: dict[str, Any]) -> bool:
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if (
+                isinstance(text, str)
+                and "<heartbeat>" in text
+                and "request-desktop-recovery" in text
+            ):
+                return True
+    return False
+
+
+def _desktop_turn_error(
+    thread: dict[str, Any],
+    turn: dict[str, Any],
+    target: TargetConfig,
+) -> dict[str, Any] | None:
+    inline_error = turn.get("error")
+    if isinstance(inline_error, dict) and any(
+        str(inline_error.get(key, "")).strip()
+        for key in ("message", "additionalDetails", "codexErrorInfo")
+    ):
+        return inline_error
+
+    turn_id = turn.get("id")
+    if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
+        return None
+    return _session_task_complete_error(
+        thread,
+        turn_id,
+        codex_home=target.codex_home,
+    )
+
+
+def _session_task_complete_error(
+    thread: dict[str, Any],
+    turn_id: str,
+    *,
+    codex_home: str,
+) -> dict[str, Any] | None:
+    path_value = thread.get("path")
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    try:
+        session_path = _normalized_local_path(path_value).resolve(strict=True)
+        sessions_root = (
+            _normalized_local_path(codex_home).resolve(strict=True)
+            / "sessions"
+        )
+        session_path.relative_to(sessions_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if session_path.suffix.lower() != ".jsonl":
+        return None
+
+    needle = turn_id.encode("utf-8")
+    try:
+        with session_path.open("rb") as handle:
+            if session_path.stat().st_size == 0:
+                return None
+            with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                position = data.rfind(needle)
+                for _ in range(64):
+                    if position < 0:
+                        break
+                    line_start = data.rfind(b"\n", 0, position) + 1
+                    line_end = data.find(b"\n", position)
+                    if line_end < 0:
+                        line_end = len(data)
+                    if line_end - line_start <= 1_048_576:
+                        try:
+                            event = json.loads(data[line_start:line_end])
+                        except (UnicodeError, json.JSONDecodeError):
+                            event = None
+                        if isinstance(event, dict):
+                            payload = event.get("payload")
+                            if (
+                                event.get("type") == "event_msg"
+                                and isinstance(payload, dict)
+                                and payload.get("type") == "task_complete"
+                                and payload.get("turn_id") == turn_id
+                            ):
+                                error = payload.get("error")
+                                return error if isinstance(error, dict) else None
+                    position = data.rfind(needle, 0, line_start)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _normalized_local_path(value: str) -> Path:
+    normalized = value
+    if os.name == "nt":
+        if normalized.startswith("\\\\?\\UNC\\"):
+            normalized = "\\\\" + normalized[8:]
+        elif normalized.startswith("\\\\?\\"):
+            normalized = normalized[4:]
+    return Path(normalized).expanduser()
+
+
+def _desktop_network_failure_turn_id(
+    thread: dict[str, Any],
+    target: TargetConfig,
+    *,
+    pending_evidence_turn_id: str | None = None,
+) -> str | None:
+    if _thread_status(thread) not in {"idle", "systemError", "notLoaded"}:
+        return None
+    if _has_in_progress_turn(thread):
+        return None
+    if _thread_source(thread) not in target.allowed_sources:
+        return None
+
+    candidate = _desktop_recovery_candidate_turn(
+        thread,
+        pending_evidence_turn_id=pending_evidence_turn_id,
+    )
+    if not isinstance(candidate, dict):
+        return None
+    turn_id = candidate.get("id")
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id
+        or len(turn_id) > 128
+    ):
+        return None
+    error = _desktop_turn_error(thread, candidate, target)
+    if not isinstance(error, dict):
+        return None
+    if not _error_looks_like_network_failure(error):
+        return None
+    return turn_id
 
 
 def _has_in_progress_turn(thread: dict[str, Any]) -> bool:
@@ -902,6 +1593,19 @@ def _has_in_progress_turn(thread: dict[str, Any]) -> bool:
             for turn in turns
         )
     )
+
+
+def _latest_turn_id(thread: dict[str, Any]) -> str | None:
+    turns = thread.get("turns")
+    if not isinstance(turns, list):
+        return None
+    for turn in reversed(turns):
+        if not isinstance(turn, dict):
+            continue
+        turn_id = turn.get("id")
+        if isinstance(turn_id, str) and turn_id:
+            return turn_id
+    return None
 
 
 def _latest_activity_timestamp(
@@ -995,6 +1699,18 @@ def _recovery_message_id(
 ) -> str:
     seed = (
         f"codex-goal-guardian:{target_name}:{outage_generation}:{thread_id}"
+    )
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+
+
+def _desktop_recovery_message_id(
+    target_name: str,
+    evidence_turn_id: str,
+    thread_id: str,
+) -> str:
+    seed = (
+        "codex-goal-guardian:desktop:"
+        f"{target_name}:{evidence_turn_id}:{thread_id}"
     )
     return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
