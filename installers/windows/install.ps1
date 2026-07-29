@@ -34,6 +34,7 @@ $ConfigPath = Join-Path $InstallRoot "config.json"
 $StatePath = Join-Path $InstallRoot "state.json"
 $LogPath = Join-Path $InstallRoot "guardian.jsonl"
 $EnvironmentBackupPath = Join-Path $InstallRoot "desktop-environment-backup.json"
+$SharedAppServerListenUrl = "ws://127.0.0.1:$AppServerPort"
 $SharedAppServerUrl = "ws://127.0.0.1:$AppServerPort/rpc"
 
 if (-not $SkipWslTask -and [string]::IsNullOrWhiteSpace($WslUser)) {
@@ -590,7 +591,7 @@ if ($DryRun) {
 
 Wait-GuardianRecoveryDrain -WindowsCommand $GuardianCommand `
     -Distro $WslDistro -LinuxUser $WslUser `
-    -SharedUrl $SharedAppServerUrl `
+    -SharedUrl $SharedAppServerListenUrl `
     -SkipWsl:$SkipWslTask -TimeoutMinutes $DrainTimeoutMinutes
 
 foreach ($OwnedTask in @($TaskWatchdog, $TaskWindows, $TaskWsl)) {
@@ -644,7 +645,7 @@ if (-not $SkipTasks) {
     ) + @($GuardianBaseArguments) + @(
         "app-server",
         "--listen",
-        $SharedAppServerUrl
+        $SharedAppServerListenUrl
     )
     $AppServerArguments = (
         (& $QuoteArgument $LauncherPath) +
@@ -722,7 +723,7 @@ if (-not $SkipTasks) {
                     [StringComparison]::OrdinalIgnoreCase
                 ) -ge 0 -and
                 $Owner.CommandLine.IndexOf(
-                    $SharedAppServerUrl,
+                    $SharedAppServerListenUrl,
                     [StringComparison]::OrdinalIgnoreCase
                 ) -ge 0
             ) {

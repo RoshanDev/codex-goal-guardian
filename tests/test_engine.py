@@ -1245,6 +1245,24 @@ class RecoveryEngineTests(unittest.TestCase):
             targets=(desktop_target,),
             recovery_prompt=self.config.recovery_prompt,
         )
+        waiting_engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: False,
+            desktop_runtime_probe=lambda _: False,
+            now=lambda: 119,
+            sleep=lambda _: None,
+        )
+
+        waiting_report = waiting_engine.run_once(config)
+
+        self.assertEqual(client.resume_calls, 0)
+        self.assertEqual(client.start_calls, 0)
+        self.assertEqual(
+            waiting_report["targets"][0]["skipped"][0]["reason"],
+            "desktop_shared_runtime_not_active",
+        )
+
         engine = RecoveryEngine(
             probe=self.healthy,
             client_factory=lambda _: client,
