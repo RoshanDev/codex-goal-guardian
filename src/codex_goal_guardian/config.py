@@ -28,6 +28,7 @@ class TargetConfig:
     thread_limit: int = 50
     resume_grace_seconds: float = 2.0
     start_recovery_turn: bool = True
+    desktop_thread_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,9 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
         thread_limit=int(data.get("thread_limit", 50)),
         resume_grace_seconds=float(data.get("resume_grace_seconds", 2.0)),
         start_recovery_turn=bool(data.get("start_recovery_turn", True)),
+        desktop_thread_ids=_desktop_thread_ids(
+            data.get("desktop_thread_ids")
+        ),
     )
 
 
@@ -147,4 +151,27 @@ def _allowed_sources(value: Any) -> tuple[str, ...]:
     )
     if not normalized or len(normalized) != len(value):
         raise ValueError("target allowed_sources must be a non-empty string array")
+    return normalized
+
+
+def _desktop_thread_ids(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("target desktop_thread_ids must be a string array")
+    normalized = tuple(
+        dict.fromkeys(
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        )
+    )
+    if (
+        len(normalized) != len(value)
+        or any(len(thread_id) > 128 for thread_id in normalized)
+    ):
+        raise ValueError(
+            "target desktop_thread_ids must contain unique non-empty "
+            "values up to 128 characters"
+        )
     return normalized

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,8 +22,10 @@ from codex_goal_guardian.health import HealthResult
 from codex_goal_guardian.state import (
     StateStore,
     default_state,
+    desktop_direct_recovery_record,
     enqueue_desktop_recovery_request,
     is_recovery_pending,
+    mark_desktop_direct_recovery,
     mark_recovered,
     pending_desktop_recovery_requests,
     recovery_record,
@@ -243,6 +246,20 @@ class DesktopGoalReactivationEligibilityTests(unittest.TestCase):
                 "id": "heartbeat-turn",
                 "status": "completed",
                 "completedAt": 145,
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "<heartbeat>run "
+                                    "request-desktop-recovery</heartbeat>"
+                                ),
+                            }
+                        ],
+                    }
+                ],
             }
         )
 
@@ -256,6 +273,105 @@ class DesktopGoalReactivationEligibilityTests(unittest.TestCase):
 
         self.assertTrue(eligible, reason)
         self.assertTrue(looks_like_network_failure(thread))
+
+    def test_session_log_recovers_network_error_hidden_by_app_server(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            codex_home = Path(temporary)
+            session_path = (
+                codex_home / "sessions" / "2026" / "07" / "rollout.jsonl"
+            )
+            session_path.parent.mkdir(parents=True)
+            session_path.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "turn_id": "turn-1",
+                            "error": {
+                                "message": (
+                                    "stream disconnected before completion"
+                                )
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            target = TargetConfig(
+                name=self.target.name,
+                command=self.target.command,
+                codex_home=str(codex_home),
+                recovery_mode=self.target.recovery_mode,
+                allowed_sources=self.target.allowed_sources,
+                max_thread_age_seconds=self.target.max_thread_age_seconds,
+                start_recovery_turn=False,
+            )
+            thread = make_thread(
+                source="vscode",
+                turn_status="completed",
+                error_message="",
+            )
+            thread["path"] = str(session_path)
+
+            eligible, reason = desktop_goal_reactivation_eligibility(
+                thread,
+                self.goal,
+                target,
+                now=150,
+                already_recovered=False,
+            )
+
+        self.assertTrue(eligible, reason)
+
+    def test_session_log_success_stays_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            codex_home = Path(temporary)
+            session_path = codex_home / "sessions" / "rollout.jsonl"
+            session_path.parent.mkdir(parents=True)
+            session_path.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "turn_id": "turn-1",
+                            "error": None,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            target = TargetConfig(
+                name=self.target.name,
+                command=self.target.command,
+                codex_home=str(codex_home),
+                recovery_mode=self.target.recovery_mode,
+                allowed_sources=self.target.allowed_sources,
+                max_thread_age_seconds=self.target.max_thread_age_seconds,
+                start_recovery_turn=False,
+            )
+            thread = make_thread(
+                source="vscode",
+                turn_status="completed",
+                error_message="",
+            )
+            thread["path"] = str(session_path)
+
+            eligible, reason = desktop_goal_reactivation_eligibility(
+                thread,
+                self.goal,
+                target,
+                now=150,
+                already_recovered=False,
+            )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "turn_completed")
 
     def test_recent_goal_activity_keeps_long_lived_thread_eligible(self) -> None:
         thread = make_thread(source="vscode", updated_at=1)
@@ -288,6 +404,55 @@ class DesktopGoalReactivationEligibilityTests(unittest.TestCase):
 
         self.assertFalse(eligible)
         self.assertEqual(reason, "turn_in_progress")
+
+    def test_pending_recovery_ignores_only_empty_interrupted_artifact(
+        self,
+    ) -> None:
+        thread = make_thread(source="vscode")
+        thread["turns"].append(
+            {
+                "id": "turn-empty-resume",
+                "status": "interrupted",
+                "error": None,
+                "items": [],
+            }
+        )
+
+        eligible, reason = desktop_goal_reactivation_eligibility(
+            thread,
+            self.goal,
+            self.target,
+            now=150,
+            already_recovered=False,
+            pending_evidence_turn_id="turn-1",
+        )
+
+        self.assertTrue(eligible, reason)
+
+    def test_pending_recovery_does_not_ignore_nonempty_newer_turn(
+        self,
+    ) -> None:
+        thread = make_thread(source="vscode")
+        thread["turns"].append(
+            {
+                "id": "turn-user",
+                "status": "interrupted",
+                "error": None,
+                "items": [{"type": "userMessage"}],
+            }
+        )
+
+        eligible, reason = desktop_goal_reactivation_eligibility(
+            thread,
+            self.goal,
+            self.target,
+            now=150,
+            already_recovered=False,
+            pending_evidence_turn_id="turn-1",
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "turn_not_network_failure")
 
 
 class _FakeClient:
@@ -736,6 +901,332 @@ class RecoveryEngineTests(unittest.TestCase):
             client.goal["timeUsedSeconds"],
             goal["timeUsedSeconds"],
         )
+
+    def test_desktop_direct_watch_reactivates_once_per_failed_turn(
+        self,
+    ) -> None:
+        desktop_target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=100,
+            start_recovery_turn=False,
+            desktop_thread_ids=("thread-1",),
+        )
+        goal = {
+            "threadId": "thread-1",
+            "objective": "finish safely",
+            "status": "blocked",
+            "tokenBudget": 40_000,
+            "tokensUsed": 1234,
+            "timeUsedSeconds": 5678,
+            "createdAt": 90,
+            "updatedAt": 110,
+        }
+        desktop = make_thread(source="vscode")
+        client = _FakeClient(listed_thread=desktop, goal=goal)
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(desktop_target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(client.reactivate_calls, 1)
+        self.assertEqual(client.resume_calls, 0)
+        self.assertEqual(client.start_calls, 0)
+        self.assertEqual(
+            report["targets"][0]["actions"][0]["mode"],
+            "direct",
+        )
+        self.assertEqual(
+            desktop_direct_recovery_record(
+                self.store.load(),
+                desktop_target.name,
+                "thread-1",
+            )["turn_id"],
+            "turn-1",
+        )
+
+        retry_client = _FakeClient(listed_thread=desktop, goal=goal)
+        retry_engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: retry_client,
+            process_probe=lambda _: True,
+            now=lambda: 121,
+            sleep=lambda _: None,
+        )
+
+        retry_report = retry_engine.run_once(config)
+
+        self.assertEqual(retry_client.reactivate_calls, 0)
+        self.assertEqual(
+            retry_report["targets"][0]["skipped"][0]["reason"],
+            "already_recovered_turn",
+        )
+
+    def test_desktop_direct_watch_reactivates_and_wakes_goal(self) -> None:
+        desktop_target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=100,
+            resume_grace_seconds=0,
+            start_recovery_turn=True,
+            desktop_thread_ids=("thread-1",),
+        )
+        goal = {
+            "threadId": "thread-1",
+            "objective": "finish safely",
+            "status": "blocked",
+            "tokenBudget": 40_000,
+            "tokensUsed": 1234,
+            "timeUsedSeconds": 5678,
+            "createdAt": 90,
+            "updatedAt": 110,
+        }
+        desktop = make_thread(source="vscode")
+        running = make_thread(
+            source="vscode",
+            thread_status="active",
+            turn_status="inProgress",
+        )
+        client = _FakeClient(
+            listed_thread=desktop,
+            read_sequence=[
+                desktop,
+                desktop,
+                desktop,
+                desktop,
+                desktop,
+                running,
+                desktop,
+            ],
+            goal=goal,
+        )
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(desktop_target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(client.reactivate_calls, 1)
+        self.assertEqual(client.resume_calls, 1)
+        self.assertEqual(client.start_calls, 1)
+        actions = report["targets"][0]["actions"]
+        self.assertEqual(actions[0]["action"], "goal_state_reactivated")
+        self.assertEqual(actions[1]["action"], "desktop_turn_started")
+        self.assertEqual(actions[2]["action"], "desktop_turn_settled")
+        record = desktop_direct_recovery_record(
+            self.store.load(),
+            desktop_target.name,
+            "thread-1",
+        )
+        self.assertEqual(record["turn_id"], "turn-1")
+        self.assertEqual(record["action"], "turn_settled")
+        self.assertEqual(record["recovery_turn_id"], "turn-recovery")
+
+    def test_desktop_direct_watch_finishes_pending_active_goal_wake(
+        self,
+    ) -> None:
+        desktop_target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=100,
+            resume_grace_seconds=0,
+            start_recovery_turn=True,
+            desktop_thread_ids=("thread-1",),
+        )
+        state = self.store.load()
+        mark_desktop_direct_recovery(
+            state,
+            desktop_target.name,
+            "thread-1",
+            turn_id="turn-1",
+            action="goal_state_reactivated",
+            now=115,
+        )
+        self.store.save(state)
+        desktop = make_thread(source="vscode")
+        desktop["turns"].append(
+            {
+                "id": "turn-empty-resume",
+                "status": "interrupted",
+                "error": None,
+                "items": [],
+            }
+        )
+        active_goal = {
+            "threadId": "thread-1",
+            "objective": "finish safely",
+            "status": "active",
+            "tokenBudget": 40_000,
+            "tokensUsed": 1234,
+            "timeUsedSeconds": 5678,
+            "createdAt": 90,
+            "updatedAt": 111,
+        }
+        client = _FakeClient(
+            listed_thread=desktop,
+            read_sequence=[
+                desktop,
+                desktop,
+                desktop,
+                desktop,
+                desktop,
+            ],
+            goal=active_goal,
+        )
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(desktop_target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(client.reactivate_calls, 0)
+        self.assertEqual(client.resume_calls, 1)
+        self.assertEqual(client.start_calls, 1)
+        self.assertEqual(
+            [action["action"] for action in report["targets"][0]["actions"]],
+            ["desktop_turn_started", "desktop_turn_settled"],
+        )
+
+    def test_desktop_direct_watch_follows_turn_started_by_resume(
+        self,
+    ) -> None:
+        desktop_target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=100,
+            resume_grace_seconds=0,
+            start_recovery_turn=True,
+            desktop_thread_ids=("thread-1",),
+        )
+        state = self.store.load()
+        mark_desktop_direct_recovery(
+            state,
+            desktop_target.name,
+            "thread-1",
+            turn_id="turn-1",
+            action="goal_state_reactivated",
+            now=115,
+        )
+        self.store.save(state)
+        desktop = make_thread(source="vscode")
+        running = make_thread(
+            source="vscode",
+            thread_status="active",
+            turn_status="inProgress",
+        )
+        running["turns"][0]["id"] = "turn-auto"
+        active_goal = {
+            "threadId": "thread-1",
+            "objective": "finish safely",
+            "status": "active",
+            "tokenBudget": 40_000,
+            "tokensUsed": 1234,
+            "timeUsedSeconds": 5678,
+            "createdAt": 90,
+            "updatedAt": 111,
+        }
+        client = _FakeClient(
+            listed_thread=desktop,
+            read_sequence=[
+                desktop,
+                desktop,
+                running,
+                running,
+                desktop,
+            ],
+            goal=active_goal,
+        )
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(desktop_target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(client.resume_calls, 1)
+        self.assertEqual(client.start_calls, 0)
+        self.assertEqual(
+            [action["action"] for action in report["targets"][0]["actions"]],
+            [
+                "desktop_runtime_became_active",
+                "desktop_turn_settled",
+            ],
+        )
+        record = desktop_direct_recovery_record(
+            self.store.load(),
+            desktop_target.name,
+            "thread-1",
+        )
+        self.assertEqual(record["action"], "turn_settled")
+        self.assertEqual(record["recovery_turn_id"], "turn-auto")
+
+    def test_desktop_app_server_timeout_allows_large_task_resume(self) -> None:
+        desktop_target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+        )
+
+        client = RecoveryEngine._default_client(desktop_target)
+
+        self.assertEqual(client.timeout_seconds, 120)
 
     def test_desktop_mode_fails_closed_if_accounting_changes(self) -> None:
         desktop_target = TargetConfig(

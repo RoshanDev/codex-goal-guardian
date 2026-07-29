@@ -1,5 +1,8 @@
 # Codex Goal Guardian design
 
+> Historical v0.3 design. The v0.5.1 allowlisted local Desktop watcher and
+> recovery contract in `README.md` supersede the heartbeat-first path below.
+
 Date: 2026-07-28
 
 ## Goal contract

@@ -46,6 +46,7 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
             "recovered": {},
             "desktop_request_generation": 0,
             "desktop_recovery_requests": {},
+            "desktop_direct_recoveries": {},
         },
     )
     target.setdefault("health", "unknown")
@@ -58,6 +59,7 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
     target.setdefault("recovered", {})
     target.setdefault("desktop_request_generation", 0)
     target.setdefault("desktop_recovery_requests", {})
+    target.setdefault("desktop_direct_recoveries", {})
     return target
 
 
@@ -247,6 +249,43 @@ def finish_desktop_recovery_request(
     )
     _prune_desktop_recovery_requests(requests)
     return True
+
+
+def desktop_direct_recovery_record(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+) -> dict[str, Any] | None:
+    records = _target_state(state, target_name)["desktop_direct_recoveries"]
+    if not isinstance(records, dict):
+        raise StateCorruptionError(
+            "Guardian desktop direct recovery records must be an object"
+        )
+    value = records.get(thread_id)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def mark_desktop_direct_recovery(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+    *,
+    turn_id: str,
+    action: str = "goal_state_reactivated",
+    recovery_turn_id: str | None = None,
+    now: int | None = None,
+) -> None:
+    records = _target_state(state, target_name)["desktop_direct_recoveries"]
+    if not isinstance(records, dict):
+        raise StateCorruptionError(
+            "Guardian desktop direct recovery records must be an object"
+        )
+    records[thread_id] = {
+        "turn_id": turn_id,
+        "action": action,
+        "recovery_turn_id": recovery_turn_id,
+        "recorded_at": int(time.time() if now is None else now),
+    }
 
 
 def _prune_desktop_recovery_requests(
