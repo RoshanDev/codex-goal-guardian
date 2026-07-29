@@ -9,6 +9,9 @@ from codex_goal_guardian.app_server import (
     AppServerError,
     _app_server_creation_flags,
 )
+from tests.fixtures.fake_websocket_app_server import (
+    FakeWebSocketAppServer,
+)
 
 
 class AppServerClientTests(unittest.TestCase):
@@ -91,6 +94,40 @@ class AppServerClientTests(unittest.TestCase):
     def test_windows_app_server_uses_create_no_window(self) -> None:
         self.assertEqual(_app_server_creation_flags("nt"), 0x08000000)
         self.assertEqual(_app_server_creation_flags("posix"), 0)
+
+    def test_shared_websocket_clients_observe_the_same_goal_state(self) -> None:
+        with FakeWebSocketAppServer() as server:
+            first = AppServerClient(
+                command=("unused",),
+                codex_home=self.temporary.name,
+                websocket_url=server.url,
+                timeout_seconds=2,
+            )
+            second = AppServerClient(
+                command=("unused",),
+                codex_home=self.temporary.name,
+                websocket_url=server.url,
+                timeout_seconds=2,
+            )
+            self.addCleanup(first.close)
+            self.addCleanup(second.close)
+
+            with first, second:
+                first.reactivate_goal("thread-1")
+                observed = second.get_goal("thread-1")
+
+        self.assertIsNotNone(observed)
+        assert observed is not None
+        self.assertEqual(observed["status"], "active")
+        self.assertEqual(observed["tokensUsed"], 100)
+
+    def test_shared_websocket_rejects_non_loopback_url(self) -> None:
+        with self.assertRaisesRegex(ValueError, "loopback"):
+            AppServerClient(
+                command=("unused",),
+                codex_home=self.temporary.name,
+                websocket_url="ws://example.com:47831/rpc",
+            )
 
 
 if __name__ == "__main__":

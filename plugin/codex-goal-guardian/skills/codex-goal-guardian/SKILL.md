@@ -13,6 +13,9 @@ attempts, whether Guardian is installed, or how to inspect its recovery state.
 - Treat an explicitly configured `desktop_thread_ids` allowlist as the
   preferred Desktop recovery authority. It is local, deterministic, and does
   not create model turns.
+- Require the Desktop target's `app_server_url` to equal the user-level
+  `CODEX_APP_SERVER_WS_URL`, and require the hidden shared App Server task to be
+  running. A separate stdio App Server is not Desktop Goal recovery.
 - Allow the external Guardian to change only a twice-validated blocked Goal to
   `active`. Require `source=vscode`, no `inProgress` turn, and an exact recent
   network failure from App Server state or the task's read-only session JSONL.
@@ -68,7 +71,8 @@ legacy fallback.
 ## Diagnosis order
 
 1. For a desktop task, confirm its exact ID is present in the Windows target's
-   `desktop_thread_ids`. Inspect the direct-recovery record and latest
+   `desktop_thread_ids`. Confirm the Desktop process and Guardian use the same
+   loopback App Server, then inspect the direct-recovery record and latest
    non-Guardian task completion. Do not create a heartbeat by default.
 2. For CLI, run `doctor` for the affected native runtime.
 3. Confirm the resolved WSL executable is a Linux path and not a Windows shim.

@@ -22,6 +22,7 @@ class TargetConfig:
     name: str
     command: tuple[str, ...]
     codex_home: str
+    app_server_url: str | None = None
     recovery_mode: str = "cli_turn"
     allowed_sources: tuple[str, ...] = ("cli", "exec")
     max_thread_age_seconds: int = 86_400
@@ -108,10 +109,17 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
         raise ValueError(
             "target recovery_mode must be cli_turn or desktop_goal_state"
         )
+    app_server_url = _optional_string(data.get("app_server_url"))
+    if recovery_mode == "desktop_goal_state" and app_server_url is None:
+        raise ValueError(
+            "desktop_goal_state target requires app_server_url so the "
+            "Guardian and Desktop app share one runtime"
+        )
     return TargetConfig(
         name=str(data["name"]),
         command=tuple(command),
         codex_home=str(data["codex_home"]),
+        app_server_url=app_server_url,
         recovery_mode=recovery_mode,
         allowed_sources=_allowed_sources(data.get("allowed_sources")),
         max_thread_age_seconds=int(data.get("max_thread_age_seconds", 86_400)),

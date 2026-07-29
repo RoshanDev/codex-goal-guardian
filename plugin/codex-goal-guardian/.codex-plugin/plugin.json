@@ -1,6 +1,6 @@
 {
   "name": "codex-goal-guardian",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Keep desktop and CLI Codex Goals recoverable without overlapping turns.",
   "author": {
     "name": "RoshanDev",
@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "Codex Goal Guardian",
     "shortDescription": "Resume active Goals without duplicate turns.",
-    "longDescription": "Runs an update-safe local desktop Goal watcher and ownership-safe Windows/WSL CLI recovery supervisor.",
+    "longDescription": "Runs an update-safe shared Desktop AppServer Goal watcher and ownership-safe Windows/WSL CLI recovery supervisor.",
     "developerName": "RoshanDev",
     "category": "Productivity",
     "capabilities": [

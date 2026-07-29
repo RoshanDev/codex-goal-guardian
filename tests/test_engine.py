@@ -902,6 +902,68 @@ class RecoveryEngineTests(unittest.TestCase):
             goal["timeUsedSeconds"],
         )
 
+    def test_desktop_mode_waits_until_app_uses_shared_runtime(self) -> None:
+        desktop_target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            app_server_url="ws://127.0.0.1:47831/rpc",
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=100,
+            start_recovery_turn=False,
+        )
+        state = self.store.load()
+        enqueue_desktop_recovery_request(
+            state,
+            desktop_target.name,
+            "thread-1",
+            now=111,
+        )
+        self.store.save(state)
+        desktop = make_thread(source="vscode")
+        client = _FakeClient(
+            listed_thread=desktop,
+            read_sequence=[desktop],
+            goal={
+                "threadId": "thread-1",
+                "objective": "finish safely",
+                "status": "blocked",
+                "tokenBudget": 40_000,
+                "tokensUsed": 1234,
+                "timeUsedSeconds": 5678,
+                "createdAt": 90,
+                "updatedAt": 110,
+            },
+        )
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(desktop_target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: False,
+            desktop_runtime_probe=lambda _: False,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(client.reactivate_calls, 0)
+        self.assertEqual(
+            report["targets"][0]["status"],
+            "recovery_pending",
+        )
+        self.assertEqual(
+            report["targets"][0]["skipped"][0]["reason"],
+            "desktop_shared_runtime_not_active",
+        )
+
     def test_desktop_direct_watch_reactivates_once_per_failed_turn(
         self,
     ) -> None:

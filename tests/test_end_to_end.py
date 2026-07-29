@@ -22,6 +22,9 @@ from codex_goal_guardian.state import (
     transition_health,
     was_recovered,
 )
+from tests.fixtures.fake_websocket_app_server import (
+    FakeWebSocketAppServer,
+)
 
 
 class _HealthyHandler(BaseHTTPRequestHandler):
@@ -134,11 +137,13 @@ class EndToEndTests(unittest.TestCase):
     def test_desktop_goal_state_reactivation_never_resumes_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            trace_path = root / "trace.jsonl"
             state_path = root / "state.json"
-            server_script = (
-                Path(__file__).parent / "fixtures" / "fake_app_server.py"
+            app_server = FakeWebSocketAppServer(
+                source="vscode",
+                goal_status="blocked",
             )
+            app_server.start()
+            self.addCleanup(app_server.close)
             health_server = ThreadingHTTPServer(
                 ("127.0.0.1", 0), _HealthyHandler
             )
@@ -177,11 +182,9 @@ class EndToEndTests(unittest.TestCase):
                         "targets": [
                             {
                                 "name": "desktop",
-                                "command": [
-                                    sys.executable,
-                                    str(server_script),
-                                ],
+                                "command": [sys.executable],
                                 "codex_home": str(root / "codex-home"),
+                                "app_server_url": app_server.url,
                                 "recovery_mode": "desktop_goal_state",
                                 "allowed_sources": ["vscode"],
                                 "max_thread_age_seconds": 4_000_000_000,
@@ -195,18 +198,7 @@ class EndToEndTests(unittest.TestCase):
             )
 
             output = io.StringIO()
-            with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "FAKE_APP_SERVER_TRACE": str(trace_path),
-                        "FAKE_APP_SERVER_SOURCE": "vscode",
-                        "FAKE_APP_SERVER_GOAL_STATUS": "blocked",
-                    },
-                    clear=False,
-                ),
-                redirect_stdout(output),
-            ):
+            with redirect_stdout(output):
                 exit_code = main(
                     [
                         "run-once",
@@ -218,10 +210,7 @@ class EndToEndTests(unittest.TestCase):
 
             report = json.loads(output.getvalue())
             stored = StateStore(state_path).load()
-            messages = [
-                json.loads(line)
-                for line in trace_path.read_text(encoding="utf-8").splitlines()
-            ]
+            messages = app_server.messages
             methods = [message["method"] for message in messages]
 
         self.assertEqual(exit_code, 0)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-goal-guardian"
-version = "0.5.1"
+version = "0.6.0"
 description = "Ownership-safe network recovery for active Codex Goals"
 readme = "README.md"
 requires-python = ">=3.10"
