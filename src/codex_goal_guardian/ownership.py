@@ -27,13 +27,26 @@ def desktop_uses_shared_app_server(target: TargetConfig) -> bool:
         return True
     if (
         not target.app_server_url
-        or os.environ.get("CODEX_APP_SERVER_WS_URL") != target.app_server_url
+        or _windows_user_environment_value("CODEX_APP_SERVER_WS_URL")
+        != target.app_server_url
     ):
         return False
 
     return _desktop_processes_use_shared_app_server(
         _windows_process_records()
     )
+
+
+def _windows_user_environment_value(name: str) -> str | None:
+    """Read a persisted per-user environment value without process inheritance."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value, _ = winreg.QueryValueEx(key, name)
+    except (ImportError, OSError):
+        return None
+    return value if isinstance(value, str) else None
 
 
 def _desktop_processes_use_shared_app_server(

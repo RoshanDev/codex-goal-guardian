@@ -4,6 +4,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codex_goal_guardian.config import TargetConfig
 from codex_goal_guardian.ownership import (
@@ -11,6 +12,7 @@ from codex_goal_guardian.ownership import (
     _command_line_matches,
     _desktop_processes_use_shared_app_server,
     cli_process_is_running,
+    desktop_uses_shared_app_server,
 )
 
 
@@ -129,6 +131,62 @@ class OwnershipProbeTests(unittest.TestCase):
         self.assertFalse(
             _desktop_processes_use_shared_app_server([])
         )
+
+    def test_desktop_shared_runtime_reads_persisted_user_setting(self) -> None:
+        shared_url = "ws://127.0.0.1:47831/rpc"
+        target = TargetConfig(
+            name="desktop",
+            command=("codex",),
+            codex_home="/tmp/codex-goal-guardian-test",
+            recovery_mode="desktop_goal_state",
+            app_server_url=shared_url,
+        )
+        app = {
+            "ExecutablePath": (
+                "C:\\Program Files\\WindowsApps\\"
+                "OpenAI.Codex_1.0_x64__test\\app\\ChatGPT.exe"
+            ),
+            "CommandLine": "ChatGPT.exe",
+        }
+
+        with (
+            mock.patch(
+                "codex_goal_guardian.ownership.os.name",
+                "nt",
+            ),
+            mock.patch(
+                "codex_goal_guardian.ownership."
+                "_windows_user_environment_value",
+                return_value=shared_url,
+            ),
+            mock.patch(
+                "codex_goal_guardian.ownership._windows_process_records",
+                return_value=[app],
+            ),
+        ):
+            self.assertTrue(desktop_uses_shared_app_server(target))
+
+    def test_desktop_shared_runtime_rejects_different_user_setting(self) -> None:
+        target = TargetConfig(
+            name="desktop",
+            command=("codex",),
+            codex_home="/tmp/codex-goal-guardian-test",
+            recovery_mode="desktop_goal_state",
+            app_server_url="ws://127.0.0.1:47831/rpc",
+        )
+
+        with (
+            mock.patch(
+                "codex_goal_guardian.ownership.os.name",
+                "nt",
+            ),
+            mock.patch(
+                "codex_goal_guardian.ownership."
+                "_windows_user_environment_value",
+                return_value="ws://127.0.0.1:47832/rpc",
+            ),
+        ):
+            self.assertFalse(desktop_uses_shared_app_server(target))
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
