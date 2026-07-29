@@ -411,6 +411,21 @@ class RecoveryEngine:
                             and goal.get("status") == "active"
                         ):
                             if (
+                                target.app_server_url is not None
+                                and not self._desktop_runtime_probe(target)
+                            ):
+                                if requested:
+                                    recovery_waiting = True
+                                report["skipped"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "reason": (
+                                            "desktop_shared_runtime_not_active"
+                                        ),
+                                    }
+                                )
+                                continue
+                            if (
                                 direct
                                 and target.start_recovery_turn
                                 and not _thread_or_turn_active(thread)

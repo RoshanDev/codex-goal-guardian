@@ -37,6 +37,14 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("app_server_url", content)
         self.assertIn("CODEX_APP_SERVER_WS_URL", content)
         self.assertIn("ws://127.0.0.1:", content)
+        self.assertIn(
+            '$SharedAppServerListenUrl = "ws://127.0.0.1:$AppServerPort"',
+            content,
+        )
+        self.assertIn(
+            '$SharedAppServerUrl = "ws://127.0.0.1:$AppServerPort/rpc"',
+            content,
+        )
         self.assertIn("Set-DesktopAppServerEnvironment", content)
         self.assertIn('allowed_sources = @("vscode")', content)
         self.assertIn("[string[]]$DesktopThreadId", content)
