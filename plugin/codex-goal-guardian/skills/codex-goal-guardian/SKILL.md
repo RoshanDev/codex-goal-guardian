@@ -62,7 +62,9 @@ owns the next turn.
 1. For a desktop task, inspect or create one same-task heartbeat whose first
    rule is to do nothing when a different turn is already `inProgress`; its
    blocked-Goal branch must queue `request-desktop-recovery`, never request a
-   manual click.
+   manual click. Use a ten-minute production interval by default because each
+   heartbeat is a model turn; use a shorter interval only for a bounded,
+   isolated live test.
 2. For CLI, run `doctor` for the affected native runtime.
 3. Confirm the resolved WSL executable is a Linux path and not a Windows shim.
 4. Inspect `status` for health, outage generation, and `recovery_pending`.

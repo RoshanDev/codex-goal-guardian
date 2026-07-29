@@ -116,8 +116,14 @@ installer rejects Windows shims explicitly.
 
 ### Windows desktop app
 
-From the Goal task itself, create a one-minute scheduled follow-up in the
+From the Goal task itself, create a ten-minute scheduled follow-up in the
 current task with this durable contract (replace `<THREAD_ID>`):
+
+Ten minutes is the recommended production interval because every heartbeat is
+a model turn and therefore consumes input, cached-input, and output tokens.
+Moving from one minute to ten minutes cuts scheduled bridge turns by 90%. The
+native Windows and WSL health watchers still run every 15 seconds; only the
+same-task wake latency changes.
 
 ```text
 Guard task <THREAD_ID> without asking the user to click Continue. The current
