@@ -29,6 +29,7 @@ class AppServerClientTests(unittest.TestCase):
         with self.client:
             threads = self.client.list_threads(limit=7)
             goal = self.client.get_goal("thread-1")
+            reactivated = self.client.reactivate_goal("thread-1")
             loaded = self.client.read_thread("thread-1", include_turns=True)
             resumed = self.client.resume_thread("thread-1")
             started = self.client.start_turn(
@@ -39,6 +40,7 @@ class AppServerClientTests(unittest.TestCase):
 
         self.assertEqual(threads[0]["id"], "thread-1")
         self.assertEqual(goal["status"], "active")
+        self.assertEqual(reactivated["status"], "active")
         self.assertEqual(loaded["turns"][-1]["status"], "failed")
         self.assertEqual(resumed["id"], "thread-1")
         self.assertEqual(started["id"], "turn-recovery")
@@ -55,10 +57,15 @@ class AppServerClientTests(unittest.TestCase):
                 "initialized",
                 "thread/list",
                 "thread/goal/get",
+                "thread/goal/set",
                 "thread/read",
                 "thread/resume",
                 "turn/start",
             ],
+        )
+        self.assertEqual(
+            messages[4]["params"],
+            {"threadId": "thread-1", "status": "active"},
         )
         turn_params = messages[-1]["params"]
         self.assertEqual(

@@ -173,6 +173,7 @@ payload = {
                 if item
             ],
             "codex_home": str(Path.home() / ".codex"),
+            "recovery_mode": "cli_turn",
             "allowed_sources": ["cli", "exec"],
             "max_thread_age_seconds": 86400,
             "thread_limit": 50,

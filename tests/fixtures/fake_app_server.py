@@ -8,6 +8,17 @@ from pathlib import Path
 
 
 TRACE_PATH = os.environ.get("FAKE_APP_SERVER_TRACE")
+THREAD_SOURCE = os.environ.get("FAKE_APP_SERVER_SOURCE", "cli")
+GOAL = {
+    "threadId": "thread-1",
+    "objective": "finish safely",
+    "status": os.environ.get("FAKE_APP_SERVER_GOAL_STATUS", "active"),
+    "tokenBudget": 40_000,
+    "tokensUsed": 100,
+    "timeUsedSeconds": 20,
+    "createdAt": 90,
+    "updatedAt": 110,
+}
 
 
 def emit(payload: dict) -> None:
@@ -49,7 +60,7 @@ def thread(status: str = "idle", *, include_turns: bool = False) -> dict:
         "status": {"type": status},
         "cwd": "/workspace",
         "cliVersion": "0.145.0",
-        "source": "cli",
+        "source": THREAD_SOURCE,
         "ephemeral": False,
         "turns": turns,
     }
@@ -80,22 +91,23 @@ for raw_line in sys.stdin:
         emit({"method": "thread/status/changed", "params": {"threadId": "thread-1"}})
         emit({"id": request_id, "result": {"data": [thread()], "nextCursor": None}})
     elif method == "thread/goal/get":
-        emit(
-            {
-                "id": request_id,
-                "result": {
-                    "goal": {
-                        "threadId": "thread-1",
-                        "objective": "finish safely",
-                        "status": "active",
-                        "tokensUsed": 100,
-                        "timeUsedSeconds": 20,
-                        "createdAt": 90,
-                        "updatedAt": 110,
-                    }
-                },
-            }
-        )
+        emit({"id": request_id, "result": {"goal": dict(GOAL)}})
+    elif method == "thread/goal/set":
+        params = message.get("params", {})
+        if set(params) != {"threadId", "status"} or params.get("status") != "active":
+            emit(
+                {
+                    "id": request_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "goal reactivation must only set status=active",
+                    },
+                }
+            )
+            continue
+        GOAL["status"] = "active"
+        GOAL["updatedAt"] += 1
+        emit({"id": request_id, "result": {"goal": dict(GOAL)}})
     elif method == "thread/read":
         emit(
             {

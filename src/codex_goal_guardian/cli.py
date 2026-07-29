@@ -16,7 +16,7 @@ from .app_server import AppServerClient
 from .config import GuardianConfig, load_config
 from .engine import RecoveryEngine
 from .health import probe_health
-from .state import StateStore
+from .state import StateStore, enqueue_desktop_recovery_request
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,6 +63,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_argument(status)
     _add_json_argument(status)
 
+    request_desktop = subparsers.add_parser(
+        "request-desktop-recovery",
+        help="queue one same-task desktop Goal recovery request",
+    )
+    _add_config_argument(request_desktop)
+    request_desktop.add_argument(
+        "--thread-id",
+        required=True,
+        help="desktop task thread ID observed by its own heartbeat",
+    )
+    request_desktop.add_argument(
+        "--target",
+        help="desktop_goal_state target name (auto-selected when unique)",
+    )
+    _add_json_argument(request_desktop)
+
     hook = subparsers.add_parser(
         "hook-record", help="record a privacy-filtered Codex hook event"
     )
@@ -103,6 +119,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "state_path": config.state_path,
                 "state": StateStore(config.state_path).load(),
             }
+            _emit(report, arguments.json_output)
+            return 0
+        if arguments.command_name == "request-desktop-recovery":
+            config = load_config(arguments.config)
+            target_name = _desktop_request_target_name(
+                config,
+                requested_name=arguments.target,
+            )
+            store = StateStore(config.state_path)
+            with store.locked():
+                state = store.load()
+                request = enqueue_desktop_recovery_request(
+                    state,
+                    target_name,
+                    arguments.thread_id,
+                )
+                if not request["coalesced"]:
+                    store.save(state)
+            report = {
+                "ok": True,
+                "target": target_name,
+                "thread_id": request["thread_id"],
+                "request_generation": request["generation"],
+                "coalesced": request["coalesced"],
+            }
+            if not request["coalesced"]:
+                append_json_log(
+                    config.log_path,
+                    {"kind": "desktop_recovery_requested", **report},
+                )
             _emit(report, arguments.json_output)
             return 0
         if arguments.command_name == "hook-record":
@@ -153,6 +199,31 @@ def doctor_config(
         if target_report["errors"]:
             report["ok"] = False
     return report
+
+
+def _desktop_request_target_name(
+    config: GuardianConfig, *, requested_name: str | None
+) -> str:
+    desktop_targets = tuple(
+        target
+        for target in config.targets
+        if target.recovery_mode == "desktop_goal_state"
+    )
+    if requested_name:
+        matches = tuple(
+            target for target in desktop_targets if target.name == requested_name
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                f"desktop_goal_state target not found: {requested_name}"
+            )
+        return matches[0].name
+    if len(desktop_targets) != 1:
+        raise ValueError(
+            "config must define exactly one desktop_goal_state target "
+            "when --target is omitted"
+        )
+    return desktop_targets[0].name
 
 
 def inspect_target(

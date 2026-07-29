@@ -7,7 +7,10 @@ from codex_goal_guardian.state import (
     StateCorruptionError,
     StateStore,
     default_state,
+    enqueue_desktop_recovery_request,
+    finish_desktop_recovery_request,
     mark_recovered,
+    pending_desktop_recovery_requests,
     transition_health,
     was_recovered,
 )
@@ -120,6 +123,78 @@ class HealthTransitionTests(unittest.TestCase):
         self.assertTrue(was_recovered(state, "windows", 3, "thread-a"))
         self.assertFalse(was_recovered(state, "windows", 4, "thread-a"))
         self.assertFalse(was_recovered(state, "wsl", 3, "thread-a"))
+
+    def test_desktop_recovery_request_coalesces_until_finished(self) -> None:
+        state = default_state()
+
+        first = enqueue_desktop_recovery_request(
+            state,
+            "desktop",
+            "thread-a",
+            now=100,
+        )
+        duplicate = enqueue_desktop_recovery_request(
+            state,
+            "desktop",
+            "thread-a",
+            now=110,
+        )
+
+        self.assertFalse(first["coalesced"])
+        self.assertTrue(duplicate["coalesced"])
+        self.assertEqual(first["generation"], duplicate["generation"])
+        self.assertEqual(
+            list(pending_desktop_recovery_requests(state, "desktop")),
+            ["thread-a"],
+        )
+
+        self.assertTrue(
+            finish_desktop_recovery_request(
+                state,
+                "desktop",
+                "thread-a",
+                expected_generation=first["generation"],
+                action="goal_state_reactivated",
+                now=120,
+            )
+        )
+        self.assertEqual(
+            pending_desktop_recovery_requests(state, "desktop"),
+            {},
+        )
+
+        next_request = enqueue_desktop_recovery_request(
+            state,
+            "desktop",
+            "thread-a",
+            now=130,
+        )
+        self.assertGreater(next_request["generation"], first["generation"])
+        self.assertFalse(next_request["coalesced"])
+
+    def test_desktop_recovery_finish_requires_matching_generation(self) -> None:
+        state = default_state()
+        request = enqueue_desktop_recovery_request(
+            state,
+            "desktop",
+            "thread-a",
+            now=100,
+        )
+
+        self.assertFalse(
+            finish_desktop_recovery_request(
+                state,
+                "desktop",
+                "thread-a",
+                expected_generation=request["generation"] + 1,
+                action="goal_state_reactivated",
+                now=110,
+            )
+        )
+        self.assertIn(
+            "thread-a",
+            pending_desktop_recovery_requests(state, "desktop"),
+        )
 
 
 class StateStoreTests(unittest.TestCase):

@@ -16,6 +16,16 @@ from codex_goal_guardian.cli import (
     is_windows_shim_under_wsl,
     main,
 )
+from codex_goal_guardian.config import (
+    DEFAULT_RECOVERY_PROMPT,
+    GuardianConfig,
+    HealthConfig,
+    TargetConfig,
+)
+from codex_goal_guardian.state import (
+    StateStore,
+    pending_desktop_recovery_requests,
+)
 
 
 class CliRoutingTests(unittest.TestCase):
@@ -107,6 +117,77 @@ class CliRoutingTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         engine.run_once.assert_called_once_with(ANY, dry_run=True)
         self.assertEqual(json.loads(output.getvalue()), report)
+
+    def test_desktop_request_is_queued_and_duplicate_is_coalesced(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = GuardianConfig(
+                state_path=str(root / "state.json"),
+                log_path=str(root / "guardian.jsonl"),
+                health=HealthConfig(),
+                targets=(
+                    TargetConfig(
+                        name="desktop",
+                        command=("codex",),
+                        codex_home=str(root / "codex-home"),
+                        recovery_mode="desktop_goal_state",
+                        allowed_sources=("vscode",),
+                        start_recovery_turn=False,
+                    ),
+                ),
+                recovery_prompt=DEFAULT_RECOVERY_PROMPT,
+            )
+            first_output = io.StringIO()
+            second_output = io.StringIO()
+            with (
+                patch(
+                    "codex_goal_guardian.cli.load_config",
+                    return_value=config,
+                ),
+                patch("codex_goal_guardian.cli.append_json_log"),
+                redirect_stdout(first_output),
+            ):
+                first_exit = main(
+                    [
+                        "request-desktop-recovery",
+                        "--config",
+                        "/tmp/config.json",
+                        "--thread-id",
+                        "thread-1",
+                        "--json",
+                    ]
+                )
+            with (
+                patch(
+                    "codex_goal_guardian.cli.load_config",
+                    return_value=config,
+                ),
+                patch("codex_goal_guardian.cli.append_json_log"),
+                redirect_stdout(second_output),
+            ):
+                second_exit = main(
+                    [
+                        "request-desktop-recovery",
+                        "--config",
+                        "/tmp/config.json",
+                        "--thread-id",
+                        "thread-1",
+                        "--json",
+                    ]
+                )
+
+            requests = pending_desktop_recovery_requests(
+                StateStore(config.state_path).load(),
+                "desktop",
+            )
+
+        self.assertEqual(first_exit, 0)
+        self.assertEqual(second_exit, 0)
+        self.assertFalse(json.loads(first_output.getvalue())["coalesced"])
+        self.assertTrue(json.loads(second_output.getvalue())["coalesced"])
+        self.assertEqual(tuple(requests), ("thread-1",))
 
 
 class HookRecordTests(unittest.TestCase):

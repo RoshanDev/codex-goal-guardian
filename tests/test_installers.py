@@ -30,6 +30,13 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("$ProbeFailureAnnounced", content)
         self.assertIn("Treating the probe as active", content)
         self.assertIn("No tasks were stopped", content)
+        self.assertIn("Update-GuardianConfig", content)
+        self.assertIn("windows-desktop-goal-state", content)
+        self.assertIn('recovery_mode = "desktop_goal_state"', content)
+        self.assertIn('allowed_sources = @("vscode")', content)
+        self.assertIn("pre-0.3.0.bak", content)
+        self.assertIn("__disabled_until_guardian_upgrade__", content)
+        self.assertIn("2592000", content)
         self.assertLess(
             content.rindex("Wait-GuardianRecoveryDrain"),
             content.index("Stop-ScheduledTask"),
@@ -62,6 +69,7 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("--node-command", content)
         self.assertIn("GUARDIAN_COMMAND_1", content)
         self.assertIn('"allowed_sources"', content)
+        self.assertIn('"recovery_mode": "cli_turn"', content)
         self.assertNotIn("/mnt/c/", content)
 
     def test_uninstallers_remove_only_guardian_owned_names(self) -> None:

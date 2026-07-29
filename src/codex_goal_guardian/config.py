@@ -22,6 +22,7 @@ class TargetConfig:
     name: str
     command: tuple[str, ...]
     codex_home: str
+    recovery_mode: str = "cli_turn"
     allowed_sources: tuple[str, ...] = ("cli", "exec")
     max_thread_age_seconds: int = 86_400
     thread_limit: int = 50
@@ -101,10 +102,16 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
         isinstance(item, str) and item for item in command
     ):
         raise ValueError("target command must be a non-empty string array")
+    recovery_mode = str(data.get("recovery_mode", "cli_turn")).strip().lower()
+    if recovery_mode not in {"cli_turn", "desktop_goal_state"}:
+        raise ValueError(
+            "target recovery_mode must be cli_turn or desktop_goal_state"
+        )
     return TargetConfig(
         name=str(data["name"]),
         command=tuple(command),
         codex_home=str(data["codex_home"]),
+        recovery_mode=recovery_mode,
         allowed_sources=_allowed_sources(data.get("allowed_sources")),
         max_thread_age_seconds=int(data.get("max_thread_age_seconds", 86_400)),
         thread_limit=int(data.get("thread_limit", 50)),

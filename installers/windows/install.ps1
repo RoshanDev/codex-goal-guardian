@@ -39,6 +39,103 @@ function Write-Plan {
     Write-Host "[Codex Goal Guardian] $Message"
 }
 
+function Set-JsonProperty {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [object]$Value
+    )
+
+    if ($null -ne $Object.PSObject.Properties[$Name]) {
+        $Object.$Name = $Value
+    } else {
+        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    }
+}
+
+function Update-GuardianConfig {
+    param(
+        [string]$Path,
+        [System.Collections.IDictionary]$DesktopTarget
+    )
+
+    $Existing = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ($Existing.schema_version -ne 1) {
+        throw "Cannot migrate unsupported Guardian config schema at $Path."
+    }
+    $OriginalJson = $Existing | ConvertTo-Json -Depth 8
+    $Targets = @($Existing.targets)
+    $Matches = @(
+        $Targets | Where-Object {
+            $_.name -eq $DesktopTarget["name"]
+        }
+    )
+    if ($Matches.Count -gt 1) {
+        throw "Guardian config contains duplicate desktop goal-state targets."
+    }
+    if ($Matches.Count -eq 0) {
+        $Existing.targets = @(
+            $Targets + [pscustomobject]$DesktopTarget
+        )
+    } else {
+        $Desktop = $Matches[0]
+        Set-JsonProperty $Desktop "recovery_mode" "desktop_goal_state"
+        Set-JsonProperty $Desktop "allowed_sources" @("vscode")
+        Set-JsonProperty $Desktop "max_thread_age_seconds" 2592000
+        Set-JsonProperty $Desktop "resume_grace_seconds" 0
+        Set-JsonProperty $Desktop "start_recovery_turn" $false
+    }
+
+    $WindowsTargets = @(
+        @($Existing.targets) | Where-Object {
+            $_.name -eq "windows"
+        }
+    )
+    if ($WindowsTargets.Count -gt 1) {
+        throw "Guardian config contains duplicate Windows CLI targets."
+    }
+    if ($WindowsTargets.Count -eq 1) {
+        $WindowsTarget = $WindowsTargets[0]
+        $Sources = @()
+        if ($null -ne $WindowsTarget.PSObject.Properties["allowed_sources"]) {
+            $Sources = @($WindowsTarget.allowed_sources)
+        }
+        if (
+            $Sources.Count -eq 1 -and
+            $Sources[0] -eq "__disabled_until_guardian_upgrade__"
+        ) {
+            Set-JsonProperty $WindowsTarget "allowed_sources" @("cli", "exec")
+        }
+        if ($null -eq $WindowsTarget.PSObject.Properties["recovery_mode"]) {
+            Set-JsonProperty $WindowsTarget "recovery_mode" "cli_turn"
+        }
+    }
+
+    $UpdatedJson = $Existing | ConvertTo-Json -Depth 8
+    if ($UpdatedJson -eq $OriginalJson) {
+        Write-Plan "preserved existing settings in $Path"
+        return
+    }
+
+    $BackupPath = "$Path.pre-0.3.0.bak"
+    if (-not (Test-Path -LiteralPath $BackupPath)) {
+        Copy-Item -LiteralPath $Path -Destination $BackupPath
+    }
+    $TemporaryPath = "$Path.tmp.$PID"
+    try {
+        $UpdatedJson |
+            Set-Content -LiteralPath $TemporaryPath -Encoding UTF8
+        $null = Get-Content -LiteralPath $TemporaryPath -Raw |
+            ConvertFrom-Json
+        Move-Item -LiteralPath $TemporaryPath -Destination $Path -Force
+    } finally {
+        if (Test-Path -LiteralPath $TemporaryPath) {
+            Remove-Item -LiteralPath $TemporaryPath -Force
+        }
+    }
+    Write-Plan "migrated update-safe desktop Goal recovery in $Path"
+}
+
 function Resolve-NativeCodex {
     if ($CodexCommand) {
         if (Test-Path -LiteralPath $CodexCommand -PathType Leaf) {
@@ -198,6 +295,88 @@ function Wait-GuardianRecoveryDrain {
     }
 }
 
+function Stop-DetachedGuardianWatchers {
+    param(
+        [string]$Runtime,
+        [string]$Distro,
+        [string]$LinuxUser,
+        [switch]$SkipWsl
+    )
+
+    $Launcher = Join-Path $Runtime "scripts\guardian-launch.py"
+    foreach ($Process in @(Get-CimInstance Win32_Process)) {
+        if (
+            $Process.ProcessId -eq $PID -or
+            [string]::IsNullOrWhiteSpace($Process.CommandLine) -or
+            $Process.CommandLine.IndexOf(
+                $Launcher,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -lt 0 -or
+            $Process.CommandLine.IndexOf(
+                " watch --config ",
+                [StringComparison]::OrdinalIgnoreCase
+            ) -lt 0
+        ) {
+            continue
+        }
+        Stop-Process -Id $Process.ProcessId -ErrorAction Stop
+        Write-Plan "stopped detached Guardian Windows watcher $($Process.ProcessId)"
+    }
+
+    if ($SkipWsl) {
+        return
+    }
+    $Wsl = Get-Command "wsl.exe" -CommandType Application `
+        -ErrorAction Stop | Select-Object -First 1
+    $WslConfig = "/home/$LinuxUser/.config/codex-goal-guardian/config.json"
+    $Terminate = @'
+current=$$
+for path in /proc/[0-9]*/cmdline; do
+    pid=${path#/proc/}
+    pid=${pid%/cmdline}
+    [ "$pid" = "$current" ] && continue
+    [ -r "$path" ] || continue
+    line=$(tr '\000' ' ' < "$path" 2>/dev/null)
+    case "$line" in
+        *python3*-m*codex_goal_guardian*watch*--config*__CONFIG__*)
+            kill -TERM "$pid"
+            ;;
+    esac
+done
+'@.Replace("__CONFIG__", $WslConfig)
+    & $Wsl.Source -d $Distro --user $LinuxUser `
+        --exec sh -c $Terminate
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to stop the detached Guardian WSL watcher."
+    }
+
+    $WslMarker = (
+        "/codex-goal-guardian/bin/codex-goal-guardian watch " +
+        "--config $WslConfig"
+    )
+    foreach ($Attempt in 1..10) {
+        $Remaining = @(
+            Get-CimInstance Win32_Process | Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_.CommandLine) -and (
+                    $_.CommandLine.IndexOf(
+                        $Launcher,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -ge 0 -or
+                    $_.CommandLine.IndexOf(
+                        $WslMarker,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -ge 0
+                )
+            }
+        )
+        if ($Remaining.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "Detached Guardian watcher did not exit after a graceful stop."
+}
+
 $CodexPath = Resolve-NativeCodex
 $PythonPath = Resolve-NativePython
 $PythonwPath = Join-Path (Split-Path -Parent $PythonPath) "pythonw.exe"
@@ -231,6 +410,17 @@ Write-Plan "verified windowless Python via $PythonwPath"
 $ProxyValue = if ($ProxyUrl) { $ProxyUrl } else { $null }
 $TcpHostValue = if ($TcpHost) { $TcpHost } else { $null }
 $TcpPortValue = if ($TcpPort -gt 0) { $TcpPort } else { $null }
+$DesktopGoalStateTarget = [ordered]@{
+    name = "windows-desktop-goal-state"
+    command = @($GuardianCommand)
+    codex_home = (Join-Path $env:USERPROFILE ".codex")
+    recovery_mode = "desktop_goal_state"
+    allowed_sources = @("vscode")
+    max_thread_age_seconds = 2592000
+    thread_limit = 50
+    resume_grace_seconds = 0
+    start_recovery_turn = $false
+}
 $Configuration = [ordered]@{
     schema_version = 1
     state_path = $StatePath
@@ -249,12 +439,14 @@ $Configuration = [ordered]@{
             name = "windows"
             command = @($GuardianCommand)
             codex_home = (Join-Path $env:USERPROFILE ".codex")
+            recovery_mode = "cli_turn"
             allowed_sources = @("cli", "exec")
             max_thread_age_seconds = 86400
             thread_limit = 50
             resume_grace_seconds = 2
             start_recovery_turn = $true
-        }
+        },
+        $DesktopGoalStateTarget
     )
 }
 
@@ -281,6 +473,8 @@ foreach ($OwnedTask in @($TaskWatchdog, $TaskWindows, $TaskWsl)) {
         Stop-ScheduledTask -TaskName $OwnedTask
     }
 }
+Stop-DetachedGuardianWatchers -Runtime $RuntimeRoot `
+    -Distro $WslDistro -LinuxUser $WslUser -SkipWsl:$SkipWslTask
 
 New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
 if (Test-Path -LiteralPath $RuntimeRoot) {
@@ -295,7 +489,8 @@ if ($ForceConfig -or -not (Test-Path -LiteralPath $ConfigPath)) {
     $Configuration | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
     Write-Plan "wrote $ConfigPath"
 } else {
-    Write-Plan "preserved existing $ConfigPath (use -ForceConfig to replace)"
+    Update-GuardianConfig -Path $ConfigPath `
+        -DesktopTarget $DesktopGoalStateTarget
 }
 
 if (-not $SkipTasks) {

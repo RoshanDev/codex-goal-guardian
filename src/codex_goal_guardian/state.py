@@ -44,6 +44,8 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
             "outage_started_at": None,
             "recovery_pending": False,
             "recovered": {},
+            "desktop_request_generation": 0,
+            "desktop_recovery_requests": {},
         },
     )
     target.setdefault("health", "unknown")
@@ -54,6 +56,8 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
     target.setdefault("outage_started_at", None)
     target.setdefault("recovery_pending", False)
     target.setdefault("recovered", {})
+    target.setdefault("desktop_request_generation", 0)
+    target.setdefault("desktop_recovery_requests", {})
     return target
 
 
@@ -163,6 +167,101 @@ def set_recovery_pending(
     state: MutableMapping[str, Any], target_name: str, pending: bool
 ) -> None:
     _target_state(state, target_name)["recovery_pending"] = bool(pending)
+
+
+def enqueue_desktop_recovery_request(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+    *,
+    now: int | None = None,
+) -> dict[str, Any]:
+    normalized_thread_id = thread_id.strip()
+    if not normalized_thread_id or len(normalized_thread_id) > 128:
+        raise ValueError("thread_id must be a non-empty value up to 128 characters")
+
+    target = _target_state(state, target_name)
+    requests = target["desktop_recovery_requests"]
+    if not isinstance(requests, dict):
+        raise StateCorruptionError(
+            "Guardian desktop recovery requests must be an object"
+        )
+    existing = requests.get(normalized_thread_id)
+    if isinstance(existing, dict) and existing.get("status") == "pending":
+        return {**existing, "thread_id": normalized_thread_id, "coalesced": True}
+
+    generation = int(target["desktop_request_generation"]) + 1
+    target["desktop_request_generation"] = generation
+    request = {
+        "generation": generation,
+        "requested_at": int(time.time() if now is None else now),
+        "status": "pending",
+    }
+    requests[normalized_thread_id] = request
+    _prune_desktop_recovery_requests(requests)
+    return {**request, "thread_id": normalized_thread_id, "coalesced": False}
+
+
+def pending_desktop_recovery_requests(
+    state: MutableMapping[str, Any], target_name: str
+) -> dict[str, dict[str, Any]]:
+    requests = _target_state(state, target_name)["desktop_recovery_requests"]
+    if not isinstance(requests, dict):
+        raise StateCorruptionError(
+            "Guardian desktop recovery requests must be an object"
+        )
+    return {
+        str(thread_id): dict(request)
+        for thread_id, request in requests.items()
+        if isinstance(request, dict) and request.get("status") == "pending"
+    }
+
+
+def finish_desktop_recovery_request(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+    *,
+    expected_generation: int,
+    action: str,
+    now: int | None = None,
+) -> bool:
+    requests = _target_state(state, target_name)["desktop_recovery_requests"]
+    if not isinstance(requests, dict):
+        raise StateCorruptionError(
+            "Guardian desktop recovery requests must be an object"
+        )
+    request = requests.get(thread_id)
+    if (
+        not isinstance(request, dict)
+        or request.get("status") != "pending"
+        or int(request.get("generation", -1)) != expected_generation
+    ):
+        return False
+    request.update(
+        {
+            "status": "finished",
+            "action": action,
+            "finished_at": int(time.time() if now is None else now),
+        }
+    )
+    _prune_desktop_recovery_requests(requests)
+    return True
+
+
+def _prune_desktop_recovery_requests(
+    requests: MutableMapping[str, Any], *, completed_limit: int = 32
+) -> None:
+    finished = sorted(
+        (
+            int(request.get("finished_at", request.get("requested_at", 0))),
+            str(thread_id),
+        )
+        for thread_id, request in requests.items()
+        if isinstance(request, dict) and request.get("status") == "finished"
+    )
+    for _, thread_id in finished[:-completed_limit]:
+        requests.pop(thread_id, None)
 
 
 def mark_recovered(

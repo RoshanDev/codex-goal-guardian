@@ -189,6 +189,13 @@ class AppServerClient:
             raise AppServerError("thread/goal/get returned an invalid goal")
         return goal
 
+    def reactivate_goal(self, thread_id: str) -> dict[str, Any]:
+        result = self.request(
+            "thread/goal/set",
+            {"threadId": thread_id, "status": "active"},
+        )
+        return self._required_object(result, "goal", "thread/goal/set")
+
     def read_thread(
         self, thread_id: str, *, include_turns: bool = True
     ) -> dict[str, Any]:

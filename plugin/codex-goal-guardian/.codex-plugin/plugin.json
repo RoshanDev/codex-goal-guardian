@@ -1,6 +1,6 @@
 {
   "name": "codex-goal-guardian",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Keep desktop and CLI Codex Goals recoverable without overlapping turns.",
   "author": {
     "name": "RoshanDev",
