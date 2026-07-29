@@ -24,6 +24,8 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("pythonw.exe", content)
         self.assertIn("[int]$DrainTimeoutMinutes", content)
         self.assertIn("Wait-GuardianRecoveryDrain", content)
+        self.assertIn('"maintenance.lock"', content)
+        self.assertIn("trap {", content)
         self.assertIn("Get-CimInstance Win32_Process", content)
         self.assertIn("/proc/[0-9]*/cmdline", content)
         self.assertIn("Select-Object -First 1", content)
@@ -126,6 +128,7 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("PYTHONPATH", content)
         self.assertIn("sys.executable", content)
         self.assertIn("CREATE_NO_WINDOW", content)
+        self.assertIn('"maintenance.lock"', content)
         self.assertNotIn("WindowsApps", content)
         self.assertNotIn("resources/app", content)
 
