@@ -18,6 +18,10 @@ Goal card and Guardian read the same state. Desktop app updates do not
 overwrite the user environment setting, supervisor, plugin, scheduled tasks,
 configuration, or recovery state.
 
+The Windows runtime validates the persisted per-user setting directly from
+`HKCU\Environment`. Task Scheduler therefore does not depend on inheriting the
+environment snapshot that existed before Guardian was installed or upgraded.
+
 ## Why this survives updates
 
 The Windows app package, `app.asar`, private UI bridges, and versioned editor
