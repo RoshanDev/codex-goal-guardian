@@ -41,6 +41,11 @@ console windows. The standalone runtime is copied to:
 - Windows: `%LOCALAPPDATA%\CodexGoalGuardian`
 - WSL2: `~/.local/share/codex-goal-guardian`
 
+During an in-place upgrade the installer holds a local maintenance marker.
+The watchdog exits quietly while that marker belongs to a live installer, so
+it cannot restart an old watcher during runtime replacement. A stale marker is
+removed automatically after an interrupted installer exits.
+
 The bundled Codex plugin adds diagnostics, local-watch guidance, and
 privacy-filtered Stop evidence. This avoids the repair-after-every-update
 behavior of main-process patchers such as Codex++.

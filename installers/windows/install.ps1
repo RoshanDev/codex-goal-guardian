@@ -594,6 +594,15 @@ Wait-GuardianRecoveryDrain -WindowsCommand $GuardianCommand `
     -SharedUrl $SharedAppServerListenUrl `
     -SkipWsl:$SkipWslTask -TimeoutMinutes $DrainTimeoutMinutes
 
+$MaintenancePath = Join-Path $InstallRoot "maintenance.lock"
+New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+Set-Content -LiteralPath $MaintenancePath -Encoding ASCII -Value $PID
+trap {
+    Remove-Item -LiteralPath $MaintenancePath -Force `
+        -ErrorAction SilentlyContinue
+    throw
+}
+
 foreach ($OwnedTask in @($TaskWatchdog, $TaskWindows, $TaskWsl)) {
     $ExistingTask = Get-ScheduledTask -TaskName $OwnedTask -ErrorAction SilentlyContinue
     if ($null -ne $ExistingTask -and $ExistingTask.State -eq "Running") {
@@ -753,3 +762,5 @@ if (-not $SkipTasks) {
 }
 
 Write-Plan "installation complete"
+Remove-Item -LiteralPath $MaintenancePath -Force `
+    -ErrorAction SilentlyContinue
