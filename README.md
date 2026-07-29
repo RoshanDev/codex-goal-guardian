@@ -49,10 +49,15 @@ and the same blocked Goal on a second pre-mutation read. It then changes only
 Goal status to `active` and verifies objective, budget, usage accounting, and
 creation time were preserved.
 
-The next heartbeat starts inside the app's existing task runtime. Its turn
-finishes immediately; Codex's active-Goal idle continuation then resumes the
-Goal automatically. The heartbeat never archives, hands off, blocks, completes,
-shrinks, or rewrites the Goal, and it emits no “click Continue” message.
+The next heartbeat starts inside the app's existing task runtime. Its
+instructions are explicitly scoped to that current `<heartbeat>` input and
+expire when the turn completes. A later
+`<codex_internal_context source="goal">` input must ignore the historical
+heartbeat restrictions and continue the Goal. Without this scope boundary, the
+automatic continuation can replay the bridge-only command and leave the Goal
+blocked again. The heartbeat never archives, hands off, blocks, completes,
+shrinks, or rewrites the Goal, and its success control packet has no visible
+message.
 
 Guardian requires two consecutive failed probes before declaring an outage,
 then two consecutive healthy probes before recovery. A single TLS/proxy blip
@@ -126,19 +131,25 @@ native Windows and WSL health watchers still run every 15 seconds; only the
 same-task wake latency changes.
 
 ```text
-Guard task <THREAD_ID> without asking the user to click Continue. The current
-heartbeat turn is not a second execution flow; if a different pre-existing
-turn is inProgress, end immediately with no user-visible message. Read the
-current Goal. If it is blocked after a recent network/stream/TLS disconnect,
-run exactly:
+Scope these instructions only to a current <heartbeat> input for this
+automation; they expire at task_complete. If a later current input is
+<codex_internal_context source="goal">, ignore every historical heartbeat
+restriction and continue the Goal from its persisted checkpoint. Do not run
+the bridge or emit heartbeat text from that later Goal continuation.
+
+For this current heartbeat turn only, run exactly:
 
 & "$env:LOCALAPPDATA\CodexGoalGuardian\runtime\scripts\run-windows.ps1" request-desktop-recovery --config "$env:LOCALAPPDATA\CodexGoalGuardian\config.json" --thread-id "<THREAD_ID>" --json
 
-Then end with no user-visible message. If the Goal is active, end immediately
-with no project mutation and no user-visible message; the app runtime owns the
-automatic Goal continuation after this heartbeat becomes idle. Never start a
-second app-server or turn, and never stop, restart, archive, hand off, pause,
-block, complete, shrink, or rewrite the Goal.
+The local Guardian owns all Goal, turn, source, network-failure, deduplication,
+and second-read safety decisions. This heartbeat does not inspect or mutate
+project files. On command success, return only this control packet, with no
+message element:
+
+<heartbeat><automation_id>codex-goal-guardian</automation_id><decision>DONT_NOTIFY</decision></heartbeat>
+
+Never start a second app-server or turn, and never stop, restart, archive, hand
+off, pause, block, complete, shrink, or rewrite the Goal.
 ```
 
 Use an in-chat scheduled follow-up, not a standalone scheduled task. Ordinary

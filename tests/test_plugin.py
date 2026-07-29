@@ -37,6 +37,18 @@ class PluginPackagingTests(unittest.TestCase):
         self.assertEqual(marketplace["plugins"][0]["version"], __version__)
         self.assertEqual(manifest["version"], __version__)
 
+    def test_desktop_heartbeat_scope_expires_before_goal_continuation(
+        self,
+    ) -> None:
+        skill = (
+            ROOT
+            / "plugin/codex-goal-guardian/skills/codex-goal-guardian/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("current `<heartbeat>` input only", skill)
+        self.assertIn('<codex_internal_context source="goal">', skill)
+        self.assertIn("must omit its `message` element", skill)
+
 
 if __name__ == "__main__":
     unittest.main()

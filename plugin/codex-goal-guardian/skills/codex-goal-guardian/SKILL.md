@@ -11,6 +11,10 @@ attempts, whether Guardian is installed, or how to inspect its recovery state.
 ## Safety contract
 
 - Treat the same-task heartbeat as the desktop wake/turn authority.
+- Scope heartbeat restrictions to the current `<heartbeat>` input only and
+  expire them at that turn's completion. A later
+  `<codex_internal_context source="goal">` input must ignore historical
+  heartbeat restrictions and continue the Goal from its persisted checkpoint.
 - Allow the external Guardian to process only an explicit same-task Desktop
   request and change only a twice-validated blocked Goal to `active`.
 - Treat the external Guardian as the native Windows/WSL CLI recovery authority.
@@ -55,7 +59,8 @@ Queue only when the Goal is blocked after a recent network/stream/TLS failure
 and no different pre-existing turn is `inProgress`. Never tell the user to
 click Continue. End the heartbeat silently after queuing. When the Goal is
 already active, also end silently so the app runtime's Goal-idle continuation
-owns the next turn.
+owns the next turn. The success control packet must omit its `message` element
+so routine bridge ticks do not render as chat text.
 
 ## Diagnosis order
 
