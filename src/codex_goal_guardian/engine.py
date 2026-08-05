@@ -23,9 +23,11 @@ from .state import (
     is_recovery_pending,
     mark_desktop_direct_recovery,
     mark_recovered,
+    model_capacity_recovery_record,
     pending_desktop_recovery_requests,
     recovery_record,
     recovery_records,
+    save_model_capacity_recovery,
     set_recovery_pending,
     transition_health,
 )
@@ -64,6 +66,7 @@ _NETWORK_ERROR_MARKERS = (
     "transport",
     "websocket",
 )
+_MODEL_CAPACITY_ERROR_MARKER = "selected model is at capacity"
 
 
 def looks_like_network_failure(thread: dict[str, Any]) -> bool:
@@ -81,11 +84,25 @@ def _turn_looks_like_network_failure(turn: dict[str, Any]) -> bool:
 
 
 def _error_looks_like_network_failure(error: dict[str, Any]) -> bool:
-    text = " ".join(
+    text = _error_text(error)
+    return any(marker in text for marker in _NETWORK_ERROR_MARKERS)
+
+
+def _error_text(error: dict[str, Any]) -> str:
+    return " ".join(
         str(error.get(key, ""))
         for key in ("message", "additionalDetails", "codexErrorInfo")
     ).lower()
-    return any(marker in text for marker in _NETWORK_ERROR_MARKERS)
+
+
+def _error_looks_like_model_capacity_failure(error: dict[str, Any]) -> bool:
+    return _MODEL_CAPACITY_ERROR_MARKER in _error_text(error)
+
+
+def looks_like_model_capacity_failure(
+    thread: dict[str, Any], target: TargetConfig
+) -> bool:
+    return _model_capacity_failure_turn(thread, target) is not None
 
 
 def thread_eligibility(
@@ -134,6 +151,41 @@ def thread_eligibility(
         return False, f"turn_{turn_status}"
     if not _turn_looks_like_network_failure(last_turn):
         return False, "turn_not_network_failure"
+    return True, "eligible"
+
+
+def model_capacity_eligibility(
+    thread: dict[str, Any],
+    goal: Optional[dict[str, Any]],
+    target: TargetConfig,
+    *,
+    now: int,
+) -> tuple[bool, str]:
+    if not target.model_capacity_fallback_models:
+        return False, "model_capacity_recovery_disabled"
+    if not isinstance(goal, dict):
+        return False, "goal_missing"
+    if str(goal.get("status", "missing")) != "active":
+        return False, f"goal_{goal.get('status', 'missing')}"
+
+    updated_at = _latest_activity_timestamp(thread, goal)
+    if updated_at is None:
+        return False, "thread_updated_at_missing"
+    if now - updated_at > target.max_thread_age_seconds:
+        return False, "thread_stale"
+
+    thread_status = _thread_status(thread)
+    if thread_status == "active":
+        return False, "thread_active"
+    if thread_status not in {"idle", "systemError", "notLoaded"}:
+        return False, f"thread_{thread_status or 'missing'}"
+    source = _thread_source(thread)
+    if source not in target.allowed_sources:
+        return False, f"source_{source or 'missing'}"
+    if _has_in_progress_turn(thread):
+        return False, "turn_in_progress"
+    if _model_capacity_failure_turn(thread, target) is None:
+        return False, "turn_not_model_capacity_failure"
     return True, "eligible"
 
 
@@ -276,6 +328,18 @@ class RecoveryEngine:
                     target_report["status"] = "confirming"
                     continue
 
+                capacity_status = "disabled"
+                if target.model_capacity_fallback_models:
+                    capacity_status = self._recover_model_capacity(
+                        config,
+                        target,
+                        state,
+                        store,
+                        target_report,
+                        timestamp,
+                        dry_run=dry_run,
+                    )
+
                 if target.recovery_mode == "desktop_goal_state":
                     requests = pending_desktop_recovery_requests(
                         state, target.name
@@ -304,6 +368,8 @@ class RecoveryEngine:
                         target_report["status"] = "error"
                     elif target_report["actions"]:
                         target_report["status"] = "recovered"
+                    elif capacity_status == "waiting":
+                        target_report["status"] = "capacity_waiting"
                     else:
                         target_report["status"] = "monitoring"
                     continue
@@ -321,6 +387,14 @@ class RecoveryEngine:
                 ):
                     set_recovery_pending(state, target.name, True)
                 if not is_recovery_pending(state, target.name):
+                    if dry_run and capacity_status != "idle":
+                        target_report["status"] = "dry_run"
+                    elif capacity_status == "waiting":
+                        target_report["status"] = "capacity_waiting"
+                    elif capacity_status == "error":
+                        target_report["status"] = "error"
+                    elif capacity_status == "acted":
+                        target_report["status"] = "recovered"
                     continue
 
                 if transition.recover_now:
@@ -339,13 +413,497 @@ class RecoveryEngine:
                     target_report["status"] = "dry_run"
                 elif complete:
                     set_recovery_pending(state, target.name, False)
-                    target_report["status"] = "recovered"
+                    target_report["status"] = (
+                        "capacity_waiting"
+                        if capacity_status == "waiting"
+                        else "recovered"
+                    )
                 else:
                     target_report["status"] = "recovery_pending"
 
             if state != initial_state:
                 store.save(state)
         return report
+
+    def _recover_model_capacity(
+        self,
+        config: GuardianConfig,
+        target: TargetConfig,
+        state: dict[str, Any],
+        store: StateStore,
+        report: dict[str, Any],
+        now: int,
+        *,
+        dry_run: bool,
+    ) -> str:
+        if target.recovery_mode == "desktop_goal_state":
+            if not target.desktop_thread_ids:
+                return "disabled"
+            if not self._desktop_runtime_probe(target):
+                report["skipped"].append(
+                    {
+                        "thread_id": None,
+                        "reason": "desktop_shared_runtime_not_active",
+                    }
+                )
+                return "idle"
+            summaries = [
+                {"id": thread_id}
+                for thread_id in target.desktop_thread_ids
+            ]
+        elif self._process_probe(target):
+            report["skipped"].append(
+                {
+                    "thread_id": None,
+                    "reason": "model_capacity_cli_process_running",
+                }
+            )
+            return "idle"
+        else:
+            summaries = None
+
+        capacity_error_context: tuple[
+            str, dict[str, Any], str, str | None
+        ] | None = None
+        try:
+            client_context = self._client_factory(target)
+            with client_context as client:
+                if summaries is None:
+                    summaries = client.list_threads(limit=target.thread_limit)
+                for summary in summaries:
+                    if not isinstance(summary, dict):
+                        continue
+                    thread_id = summary.get("id")
+                    if not isinstance(thread_id, str) or not thread_id:
+                        continue
+                    thread = client.read_thread(thread_id, include_turns=True)
+                    failure_turn = _model_capacity_failure_turn(thread, target)
+                    if failure_turn is None:
+                        continue
+                    goal = client.get_goal(thread_id)
+                    eligible, reason = model_capacity_eligibility(
+                        thread,
+                        goal,
+                        target,
+                        now=now,
+                    )
+                    if not eligible:
+                        report["skipped"].append(
+                            {"thread_id": thread_id, "reason": reason}
+                        )
+                        return (
+                            "waiting"
+                            if reason in _WAITING_RECOVERY_REASONS
+                            else "idle"
+                        )
+
+                    failure_turn_id = str(failure_turn.get("id", ""))
+                    if not failure_turn_id or len(failure_turn_id) > 128:
+                        report["skipped"].append(
+                            {
+                                "thread_id": thread_id,
+                                "reason": "model_capacity_turn_id_missing",
+                            }
+                        )
+                        return "idle"
+
+                    record = model_capacity_recovery_record(
+                        state, target.name, thread_id
+                    )
+                    if record is None:
+                        record = _new_model_capacity_record(
+                            failure_turn_id,
+                            target,
+                            now=now,
+                        )
+                        if not dry_run:
+                            save_model_capacity_recovery(
+                                state,
+                                target.name,
+                                thread_id,
+                                record,
+                                now=now,
+                            )
+                            store.save(state)
+                        report["actions"].append(
+                            {
+                                "thread_id": thread_id,
+                                "action": "model_capacity_retry_scheduled",
+                                "model": "thread_default",
+                                "next_retry_at": record["next_retry_at"],
+                            }
+                        )
+                        return "waiting"
+
+                    previous_failure_id = str(
+                        record.get("failure_turn_id", "")
+                    )
+                    recovery_turn_id = str(
+                        record.get("recovery_turn_id", "")
+                    )
+                    if failure_turn_id == recovery_turn_id and (
+                        failure_turn_id != previous_failure_id
+                    ):
+                        record = _schedule_observed_capacity_failure(
+                            record,
+                            failure_turn_id,
+                            target,
+                            now=now,
+                        )
+                        if not dry_run:
+                            save_model_capacity_recovery(
+                                state,
+                                target.name,
+                                thread_id,
+                                record,
+                                now=now,
+                            )
+                            store.save(state)
+                        report["actions"].append(
+                            {
+                                "thread_id": thread_id,
+                                "action": "model_capacity_retry_scheduled",
+                                "model": _capacity_model_label(record),
+                                "next_retry_at": record["next_retry_at"],
+                            }
+                        )
+                        return "waiting"
+                    if failure_turn_id != previous_failure_id:
+                        record = _new_model_capacity_record(
+                            failure_turn_id,
+                            target,
+                            now=now,
+                        )
+                        if not dry_run:
+                            save_model_capacity_recovery(
+                                state,
+                                target.name,
+                                thread_id,
+                                record,
+                                now=now,
+                            )
+                            store.save(state)
+                        report["actions"].append(
+                            {
+                                "thread_id": thread_id,
+                                "action": "model_capacity_retry_scheduled",
+                                "model": "thread_default",
+                                "next_retry_at": record["next_retry_at"],
+                            }
+                        )
+                        return "waiting"
+                    if record.get("action") == "fallbacks_exhausted":
+                        report["skipped"].append(
+                            {
+                                "thread_id": thread_id,
+                                "reason": "model_capacity_fallbacks_exhausted",
+                            }
+                        )
+                        return "idle"
+
+                    next_retry_at = int(record.get("next_retry_at", 0) or 0)
+                    if now < next_retry_at:
+                        report["skipped"].append(
+                            {
+                                "thread_id": thread_id,
+                                "reason": "model_capacity_backoff",
+                                "model": _capacity_model_label(record),
+                                "next_retry_at": next_retry_at,
+                            }
+                        )
+                        return "waiting"
+
+                    model_index = int(record.get("model_index", 0))
+                    attempts_in_model = int(
+                        record.get("attempts_in_model", 0)
+                    )
+                    if attempts_in_model >= target.model_capacity_retry_limit:
+                        if model_index >= len(
+                            target.model_capacity_fallback_models
+                        ):
+                            record.update(
+                                {
+                                    "action": "fallbacks_exhausted",
+                                    "next_retry_at": None,
+                                }
+                            )
+                            if not dry_run:
+                                save_model_capacity_recovery(
+                                    state,
+                                    target.name,
+                                    thread_id,
+                                    record,
+                                    now=now,
+                                )
+                                store.save(state)
+                            report["actions"].append(
+                                {
+                                    "thread_id": thread_id,
+                                    "action": (
+                                        "model_capacity_fallbacks_exhausted"
+                                    ),
+                                }
+                            )
+                            return "acted"
+                        model_index += 1
+                        attempts_in_model = 0
+
+                    model = _capacity_model(target, model_index)
+                    attempt_number = attempts_in_model + 1
+                    total_attempts = int(record.get("total_attempts", 0)) + 1
+                    message_id = _model_capacity_message_id(
+                        target.name,
+                        thread_id,
+                        failure_turn_id,
+                        model_index,
+                        attempt_number,
+                    )
+                    if dry_run:
+                        report["actions"].append(
+                            {
+                                "thread_id": thread_id,
+                                "action": "would_retry_model_capacity",
+                                "model": model or "thread_default",
+                                "attempt": attempt_number,
+                                "retry_limit": (
+                                    target.model_capacity_retry_limit
+                                ),
+                            }
+                        )
+                        return "acted"
+
+                    fresh_thread = client.read_thread(
+                        thread_id, include_turns=True
+                    )
+                    fresh_goal = client.get_goal(thread_id)
+                    fresh_eligible, fresh_reason = model_capacity_eligibility(
+                        fresh_thread,
+                        fresh_goal,
+                        target,
+                        now=now,
+                    )
+                    fresh_failure = _model_capacity_failure_turn(
+                        fresh_thread, target
+                    )
+                    if (
+                        not fresh_eligible
+                        or not isinstance(fresh_failure, dict)
+                        or fresh_failure.get("id") != failure_turn_id
+                    ):
+                        report["skipped"].append(
+                            {
+                                "thread_id": thread_id,
+                                "reason": (
+                                    fresh_reason
+                                    if not fresh_eligible
+                                    else "model_capacity_evidence_changed"
+                                ),
+                            }
+                        )
+                        return (
+                            "waiting"
+                            if fresh_reason in _WAITING_RECOVERY_REASONS
+                            else "idle"
+                        )
+
+                    record.update(
+                        {
+                            "action": "start_requested",
+                            "model_index": model_index,
+                            "model": model,
+                            "attempts_in_model": attempt_number,
+                            "total_attempts": total_attempts,
+                            "client_user_message_id": message_id,
+                            "recovery_turn_id": None,
+                            "next_retry_at": None,
+                        }
+                    )
+                    save_model_capacity_recovery(
+                        state,
+                        target.name,
+                        thread_id,
+                        record,
+                        now=now,
+                    )
+                    store.save(state)
+                    capacity_error_context = (
+                        thread_id,
+                        dict(record),
+                        failure_turn_id,
+                        model,
+                    )
+
+                    client.resume_thread(thread_id)
+                    if target.resume_grace_seconds > 0:
+                        self._sleep(target.resume_grace_seconds)
+                    resumed_thread = client.read_thread(
+                        thread_id, include_turns=True
+                    )
+                    resumed_goal = client.get_goal(thread_id)
+                    if (
+                        not isinstance(resumed_goal, dict)
+                        or resumed_goal.get("status") != "active"
+                    ):
+                        record.update(
+                            {"action": "goal_changed", "next_retry_at": None}
+                        )
+                        save_model_capacity_recovery(
+                            state,
+                            target.name,
+                            thread_id,
+                            record,
+                            now=now,
+                        )
+                        store.save(state)
+                        report["actions"].append(
+                            {
+                                "thread_id": thread_id,
+                                "action": "model_capacity_goal_changed",
+                            }
+                        )
+                        return "acted"
+
+                    if _thread_or_turn_active(resumed_thread):
+                        started_turn_id = _latest_turn_id(resumed_thread)
+                    else:
+                        turn = client.start_turn(
+                            thread_id,
+                            prompt=config.recovery_prompt,
+                            client_user_message_id=message_id,
+                            model=model,
+                        )
+                        value = turn.get("id")
+                        started_turn_id = (
+                            str(value) if value is not None else None
+                        )
+                    record.update(
+                        {
+                            "action": "turn_started",
+                            "recovery_turn_id": started_turn_id,
+                        }
+                    )
+                    save_model_capacity_recovery(
+                        state,
+                        target.name,
+                        thread_id,
+                        record,
+                        now=now,
+                    )
+                    store.save(state)
+                    report["actions"].append(
+                        {
+                            "thread_id": thread_id,
+                            "action": "model_capacity_retry_started",
+                            "turn_id": started_turn_id,
+                            "model": model or "thread_default",
+                            "attempt": attempt_number,
+                            "retry_limit": target.model_capacity_retry_limit,
+                            "client_user_message_id": message_id,
+                        }
+                    )
+
+                    settled_thread, settled_goal = self._wait_until_settled(
+                        client, thread_id, target
+                    )
+                    settled_at = int(self._now())
+                    settled_failure = _model_capacity_failure_turn(
+                        settled_thread, target
+                    )
+                    if isinstance(settled_failure, dict) and (
+                        started_turn_id is None
+                        or settled_failure.get("id") == started_turn_id
+                    ):
+                        record = _schedule_observed_capacity_failure(
+                            record,
+                            str(settled_failure.get("id", failure_turn_id)),
+                            target,
+                            now=settled_at,
+                        )
+                        save_model_capacity_recovery(
+                            state,
+                            target.name,
+                            thread_id,
+                            record,
+                            now=settled_at,
+                        )
+                        store.save(state)
+                        report["actions"].append(
+                            {
+                                "thread_id": thread_id,
+                                "action": "model_capacity_retry_failed",
+                                "turn_id": started_turn_id,
+                                "model": model or "thread_default",
+                                "next_retry_at": record["next_retry_at"],
+                            }
+                        )
+                        return "waiting"
+
+                    record.update(
+                        {
+                            "action": "turn_settled",
+                            "next_retry_at": None,
+                        }
+                    )
+                    save_model_capacity_recovery(
+                        state,
+                        target.name,
+                        thread_id,
+                        record,
+                        now=settled_at,
+                    )
+                    store.save(state)
+                    report["actions"].append(
+                        {
+                            "thread_id": thread_id,
+                            "action": "model_capacity_retry_settled",
+                            "turn_id": started_turn_id,
+                            "model": model or "thread_default",
+                            "goal_status": (
+                                settled_goal.get("status")
+                                if isinstance(settled_goal, dict)
+                                else None
+                            ),
+                        }
+                    )
+                    return "acted"
+                return "idle"
+        except Exception as error:
+            if (
+                capacity_error_context is not None
+                and _MODEL_CAPACITY_ERROR_MARKER in str(error).lower()
+            ):
+                thread_id, record, failure_turn_id, model = (
+                    capacity_error_context
+                )
+                failed_at = int(self._now())
+                record = _schedule_observed_capacity_failure(
+                    record,
+                    failure_turn_id,
+                    target,
+                    now=failed_at,
+                )
+                save_model_capacity_recovery(
+                    state,
+                    target.name,
+                    thread_id,
+                    record,
+                    now=failed_at,
+                )
+                store.save(state)
+                report["actions"].append(
+                    {
+                        "thread_id": thread_id,
+                        "action": "model_capacity_retry_failed",
+                        "turn_id": None,
+                        "model": model or "thread_default",
+                        "next_retry_at": record["next_retry_at"],
+                    }
+                )
+                return "waiting"
+            report["errors"].append(
+                {"thread_id": None, "error": _safe_exception(error)}
+            )
+            return "error"
 
     def _recover_desktop_requests(
         self,
@@ -1467,6 +2025,104 @@ def _latest_recovery_candidate_turn(
         if isinstance(turn, dict) and not _is_guardian_heartbeat_turn(turn):
             return turn
     return None
+
+
+def _model_capacity_failure_turn(
+    thread: dict[str, Any], target: TargetConfig
+) -> dict[str, Any] | None:
+    candidate = _latest_recovery_candidate_turn(thread)
+    if not isinstance(candidate, dict):
+        return None
+    if str(candidate.get("status", "")) not in {
+        "completed",
+        "failed",
+        "interrupted",
+    }:
+        return None
+    error = _desktop_turn_error(thread, candidate, target)
+    if not isinstance(error, dict):
+        return None
+    if not _error_looks_like_model_capacity_failure(error):
+        return None
+    return candidate
+
+
+def _new_model_capacity_record(
+    failure_turn_id: str,
+    target: TargetConfig,
+    *,
+    now: int,
+) -> dict[str, Any]:
+    failure_count = 1
+    return {
+        "failure_turn_id": failure_turn_id,
+        "recovery_turn_id": None,
+        "action": "retry_scheduled",
+        "model_index": 0,
+        "model": None,
+        "attempts_in_model": 0,
+        "total_attempts": 0,
+        "capacity_failure_count": failure_count,
+        "next_retry_at": now + _model_capacity_backoff_seconds(
+            target, failure_count
+        ),
+    }
+
+
+def _schedule_observed_capacity_failure(
+    record: dict[str, Any],
+    failure_turn_id: str,
+    target: TargetConfig,
+    *,
+    now: int,
+) -> dict[str, Any]:
+    updated = dict(record)
+    failure_count = int(updated.get("capacity_failure_count", 0)) + 1
+    updated.update(
+        {
+            "failure_turn_id": failure_turn_id,
+            "recovery_turn_id": None,
+            "action": "retry_scheduled",
+            "capacity_failure_count": failure_count,
+            "next_retry_at": now
+            + _model_capacity_backoff_seconds(target, failure_count),
+        }
+    )
+    return updated
+
+
+def _model_capacity_backoff_seconds(
+    target: TargetConfig, failure_count: int
+) -> int:
+    exponent = max(0, min(failure_count - 1, 30))
+    delay = target.model_capacity_backoff_initial_seconds * (2**exponent)
+    return min(delay, target.model_capacity_backoff_max_seconds)
+
+
+def _capacity_model(target: TargetConfig, model_index: int) -> str | None:
+    if model_index == 0:
+        return None
+    return target.model_capacity_fallback_models[model_index - 1]
+
+
+def _capacity_model_label(record: dict[str, Any]) -> str:
+    value = record.get("model")
+    return str(value) if isinstance(value, str) and value else "thread_default"
+
+
+def _model_capacity_message_id(
+    target_name: str,
+    thread_id: str,
+    failure_turn_id: str,
+    model_index: int,
+    attempt_number: int,
+) -> str:
+    value = (
+        "codex-goal-guardian:model-capacity:"
+        f"{target_name}:{thread_id}:{failure_turn_id}:"
+        f"{model_index}:{attempt_number}"
+    )
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, value))
 
 
 def _desktop_recovery_candidate_turn(

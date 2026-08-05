@@ -35,10 +35,16 @@ class AppServerClientTests(unittest.TestCase):
             reactivated = self.client.reactivate_goal("thread-1")
             loaded = self.client.read_thread("thread-1", include_turns=True)
             resumed = self.client.resume_thread("thread-1")
-            started = self.client.start_turn(
+            started_default = self.client.start_turn(
                 "thread-1",
                 prompt="reconcile and continue",
                 client_user_message_id="message-1",
+            )
+            started = self.client.start_turn(
+                "thread-1",
+                prompt="reconcile with fallback",
+                client_user_message_id="message-2",
+                model="gpt-fallback",
             )
 
         self.assertEqual(threads[0]["id"], "thread-1")
@@ -46,6 +52,7 @@ class AppServerClientTests(unittest.TestCase):
         self.assertEqual(reactivated["status"], "active")
         self.assertEqual(loaded["turns"][-1]["status"], "failed")
         self.assertEqual(resumed["id"], "thread-1")
+        self.assertEqual(started_default["id"], "turn-recovery")
         self.assertEqual(started["id"], "turn-recovery")
 
         messages = [
@@ -64,18 +71,24 @@ class AppServerClientTests(unittest.TestCase):
                 "thread/read",
                 "thread/resume",
                 "turn/start",
+                "turn/start",
             ],
         )
         self.assertEqual(
             messages[4]["params"],
             {"threadId": "thread-1", "status": "active"},
         )
+        default_turn_params = messages[-2]["params"]
+        self.assertNotIn("model", default_turn_params)
+        self.assertNotIn("effort", default_turn_params)
         turn_params = messages[-1]["params"]
         self.assertEqual(
             turn_params["input"],
-            [{"type": "text", "text": "reconcile and continue"}],
+            [{"type": "text", "text": "reconcile with fallback"}],
         )
-        self.assertEqual(turn_params["clientUserMessageId"], "message-1")
+        self.assertEqual(turn_params["clientUserMessageId"], "message-2")
+        self.assertEqual(turn_params["model"], "gpt-fallback")
+        self.assertNotIn("effort", turn_params)
 
     def test_request_timeout_is_bounded(self) -> None:
         with self.client:

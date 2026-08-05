@@ -29,6 +29,10 @@ class TargetConfig:
     thread_limit: int = 50
     resume_grace_seconds: float = 2.0
     start_recovery_turn: bool = True
+    model_capacity_retry_limit: int = 10
+    model_capacity_backoff_initial_seconds: int = 15
+    model_capacity_backoff_max_seconds: int = 600
+    model_capacity_fallback_models: tuple[str, ...] = ()
     desktop_thread_ids: tuple[str, ...] = ()
 
 
@@ -115,6 +119,29 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
             "desktop_goal_state target requires app_server_url so the "
             "Guardian and Desktop app share one runtime"
         )
+    model_capacity_retry_limit = int(
+        data.get("model_capacity_retry_limit", 10)
+    )
+    model_capacity_backoff_initial_seconds = int(
+        data.get("model_capacity_backoff_initial_seconds", 15)
+    )
+    model_capacity_backoff_max_seconds = int(
+        data.get("model_capacity_backoff_max_seconds", 600)
+    )
+    if model_capacity_retry_limit < 1:
+        raise ValueError("model_capacity_retry_limit must be at least 1")
+    if model_capacity_backoff_initial_seconds < 1:
+        raise ValueError(
+            "model_capacity_backoff_initial_seconds must be at least 1"
+        )
+    if (
+        model_capacity_backoff_max_seconds
+        < model_capacity_backoff_initial_seconds
+    ):
+        raise ValueError(
+            "model_capacity_backoff_max_seconds must be greater than or "
+            "equal to model_capacity_backoff_initial_seconds"
+        )
     return TargetConfig(
         name=str(data["name"]),
         command=tuple(command),
@@ -126,6 +153,16 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
         thread_limit=int(data.get("thread_limit", 50)),
         resume_grace_seconds=float(data.get("resume_grace_seconds", 2.0)),
         start_recovery_turn=bool(data.get("start_recovery_turn", True)),
+        model_capacity_retry_limit=model_capacity_retry_limit,
+        model_capacity_backoff_initial_seconds=(
+            model_capacity_backoff_initial_seconds
+        ),
+        model_capacity_backoff_max_seconds=(
+            model_capacity_backoff_max_seconds
+        ),
+        model_capacity_fallback_models=_model_capacity_fallback_models(
+            data.get("model_capacity_fallback_models")
+        ),
         desktop_thread_ids=_desktop_thread_ids(
             data.get("desktop_thread_ids")
         ),
@@ -159,6 +196,31 @@ def _allowed_sources(value: Any) -> tuple[str, ...]:
     )
     if not normalized or len(normalized) != len(value):
         raise ValueError("target allowed_sources must be a non-empty string array")
+    return normalized
+
+
+def _model_capacity_fallback_models(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(
+            "model_capacity_fallback_models must be a string array"
+        )
+    normalized = tuple(
+        item.strip()
+        for item in value
+        if isinstance(item, str) and item.strip()
+    )
+    if len(normalized) != len(value):
+        raise ValueError(
+            "model_capacity_fallback_models must contain non-empty strings"
+        )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("model_capacity_fallback_models must be unique")
+    if any(len(item) > 128 for item in normalized):
+        raise ValueError(
+            "model_capacity_fallback_models values must be at most 128 characters"
+        )
     return normalized
 
 

@@ -15,7 +15,9 @@ from codex_goal_guardian.config import (
 from codex_goal_guardian.engine import (
     RecoveryEngine,
     desktop_goal_reactivation_eligibility,
+    looks_like_model_capacity_failure,
     looks_like_network_failure,
+    model_capacity_eligibility,
     thread_eligibility,
 )
 from codex_goal_guardian.health import HealthResult
@@ -27,6 +29,7 @@ from codex_goal_guardian.state import (
     is_recovery_pending,
     mark_desktop_direct_recovery,
     mark_recovered,
+    model_capacity_recovery_record,
     pending_desktop_recovery_requests,
     recovery_record,
     transition_health,
@@ -57,6 +60,11 @@ def make_thread(
     }
 
 
+MODEL_CAPACITY_ERROR = (
+    "Selected model is at capacity. Please try a different model."
+)
+
+
 class EligibilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.target = TargetConfig(
@@ -84,6 +92,26 @@ class EligibilityTests(unittest.TestCase):
         thread = make_thread(error_message="tool command returned exit code 2")
 
         self.assertFalse(looks_like_network_failure(thread))
+
+    def test_exact_model_capacity_failure_is_eligible(self) -> None:
+        target = TargetConfig(
+            name="wsl",
+            command=("codex",),
+            codex_home="/tmp/codex",
+            max_thread_age_seconds=100,
+            model_capacity_fallback_models=("gpt-fallback",),
+        )
+        thread = make_thread(error_message=MODEL_CAPACITY_ERROR)
+
+        eligible, reason = model_capacity_eligibility(
+            thread,
+            self.goal,
+            target,
+            now=150,
+        )
+
+        self.assertTrue(eligible, reason)
+        self.assertTrue(looks_like_model_capacity_failure(thread, target))
 
     def test_idle_completed_turn_is_rejected(self) -> None:
         eligible, reason = thread_eligibility(
@@ -481,6 +509,7 @@ class _FakeClient:
         self.reactivated_goal = reactivated_goal
         self.resume_calls = 0
         self.start_calls = 0
+        self.start_models: list[str | None] = []
         self.reactivate_calls = 0
         self.read_calls = 0
         self.list_calls = 0
@@ -524,11 +553,52 @@ class _FakeClient:
         *,
         prompt: str,
         client_user_message_id: str,
+        model: str | None = None,
     ) -> dict:
         self.start_calls += 1
+        self.start_models.append(model)
         if self.fail_start:
             raise AppServerError("simulated turn/start failure")
         return {"id": "turn-recovery", "status": "inProgress"}
+
+
+class _CapacityClient(_FakeClient):
+    def __init__(self) -> None:
+        super().__init__(
+            listed_thread=make_thread(error_message=MODEL_CAPACITY_ERROR)
+        )
+
+    def start_turn(
+        self,
+        thread_id: str,
+        *,
+        prompt: str,
+        client_user_message_id: str,
+        model: str | None = None,
+    ) -> dict:
+        self.start_calls += 1
+        self.start_models.append(model)
+        turn_id = f"turn-capacity-{self.start_calls}"
+        self.listed_thread = make_thread(
+            updated_at=110 + self.start_calls,
+            error_message=MODEL_CAPACITY_ERROR,
+        )
+        self.listed_thread["turns"][0]["id"] = turn_id
+        return {"id": turn_id, "status": "inProgress"}
+
+
+class _ImmediateCapacityClient(_CapacityClient):
+    def start_turn(
+        self,
+        thread_id: str,
+        *,
+        prompt: str,
+        client_user_message_id: str,
+        model: str | None = None,
+    ) -> dict:
+        self.start_calls += 1
+        self.start_models.append(model)
+        raise AppServerError(MODEL_CAPACITY_ERROR)
 
 
 class RecoveryEngineTests(unittest.TestCase):
@@ -580,6 +650,238 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual(second["targets"][0]["status"], "healthy")
         state = self.store.load()
         self.assertTrue(was_recovered(state, "wsl", 1, "thread-1"))
+
+    def test_model_capacity_retries_default_before_fallback_with_capped_backoff(
+        self,
+    ) -> None:
+        clock = {"now": 100}
+        client = _CapacityClient()
+        target = TargetConfig(
+            name="wsl",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            max_thread_age_seconds=1_000_000,
+            resume_grace_seconds=0,
+            model_capacity_retry_limit=10,
+            model_capacity_backoff_initial_seconds=15,
+            model_capacity_backoff_max_seconds=600,
+            model_capacity_fallback_models=("gpt-fallback",),
+        )
+        config = GuardianConfig(
+            state_path=self.config.state_path,
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+
+        def run_once() -> dict:
+            engine = RecoveryEngine(
+                probe=self.healthy,
+                client_factory=lambda _: client,
+                process_probe=lambda _: False,
+                now=lambda: clock["now"],
+                sleep=lambda _: None,
+            )
+            return engine.run_once(config)
+
+        first = run_once()
+        record = model_capacity_recovery_record(
+            self.store.load(), "wsl", "thread-1"
+        )
+        self.assertEqual(first["targets"][0]["status"], "capacity_waiting")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["next_retry_at"] - clock["now"], 15)
+
+        observed_delays = [15]
+        for _ in range(10):
+            clock["now"] = int(record["next_retry_at"])
+            run_once()
+            record = model_capacity_recovery_record(
+                self.store.load(), "wsl", "thread-1"
+            )
+            self.assertIsNotNone(record)
+            observed_delays.append(
+                int(record["next_retry_at"]) - clock["now"]
+            )
+
+        self.assertEqual(client.start_models, [None] * 10)
+        self.assertEqual(
+            observed_delays[:7],
+            [15, 30, 60, 120, 240, 480, 600],
+        )
+        self.assertTrue(all(delay <= 600 for delay in observed_delays))
+
+        clock["now"] = int(record["next_retry_at"])
+        run_once()
+
+        self.assertEqual(client.start_models[-1], "gpt-fallback")
+        record = model_capacity_recovery_record(
+            self.store.load(), "wsl", "thread-1"
+        )
+        self.assertEqual(record["model_index"], 1)
+        self.assertEqual(record["attempts_in_model"], 1)
+
+    def test_immediate_model_capacity_error_keeps_exponential_backoff(
+        self,
+    ) -> None:
+        clock = {"now": 100}
+        client = _ImmediateCapacityClient()
+        target = TargetConfig(
+            name="wsl",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            max_thread_age_seconds=1_000_000,
+            resume_grace_seconds=0,
+            model_capacity_fallback_models=("gpt-fallback",),
+        )
+        config = GuardianConfig(
+            state_path=self.config.state_path,
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: False,
+            now=lambda: clock["now"],
+            sleep=lambda _: None,
+        )
+
+        engine.run_once(config)
+        clock["now"] = 115
+        report = engine.run_once(config)
+        record = model_capacity_recovery_record(
+            self.store.load(), "wsl", "thread-1"
+        )
+
+        self.assertFalse(report["targets"][0]["errors"])
+        self.assertEqual(report["targets"][0]["status"], "capacity_waiting")
+        self.assertEqual(record["next_retry_at"], 145)
+        self.assertEqual(record["attempts_in_model"], 1)
+
+    def test_model_capacity_fails_closed_after_all_models_are_exhausted(
+        self,
+    ) -> None:
+        clock = {"now": 100}
+        client = _CapacityClient()
+        target = TargetConfig(
+            name="wsl",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            max_thread_age_seconds=1_000_000,
+            resume_grace_seconds=0,
+            model_capacity_retry_limit=1,
+            model_capacity_fallback_models=("gpt-fallback",),
+        )
+        config = GuardianConfig(
+            state_path=self.config.state_path,
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: False,
+            now=lambda: clock["now"],
+            sleep=lambda _: None,
+        )
+
+        engine.run_once(config)
+        for _ in range(3):
+            record = model_capacity_recovery_record(
+                self.store.load(), "wsl", "thread-1"
+            )
+            clock["now"] = int(record["next_retry_at"])
+            report = engine.run_once(config)
+
+        record = model_capacity_recovery_record(
+            self.store.load(), "wsl", "thread-1"
+        )
+        self.assertEqual(client.start_models, [None, "gpt-fallback"])
+        self.assertEqual(record["action"], "fallbacks_exhausted")
+        self.assertEqual(
+            report["targets"][0]["actions"][0]["action"],
+            "model_capacity_fallbacks_exhausted",
+        )
+
+    def test_model_capacity_probe_defers_quietly_while_cli_is_running(
+        self,
+    ) -> None:
+        self.store.save(default_state())
+        target = TargetConfig(
+            name="wsl",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            model_capacity_fallback_models=("gpt-fallback",),
+        )
+        config = GuardianConfig(
+            state_path=self.config.state_path,
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: self.fail("app-server must stay closed"),
+            process_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(report["targets"][0]["status"], "healthy")
+        self.assertEqual(
+            report["targets"][0]["skipped"][0]["reason"],
+            "model_capacity_cli_process_running",
+        )
+
+    def test_model_capacity_is_scheduled_for_allowlisted_desktop_thread(
+        self,
+    ) -> None:
+        client = _CapacityClient()
+        client.listed_thread["source"] = "vscode"
+        target = TargetConfig(
+            name="desktop",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            app_server_url="ws://127.0.0.1:47831/rpc",
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=1_000_000,
+            resume_grace_seconds=0,
+            desktop_thread_ids=("thread-1",),
+            model_capacity_fallback_models=("gpt-fallback",),
+        )
+        config = GuardianConfig(
+            state_path=self.config.state_path,
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: self.fail("CLI probe must not run"),
+            desktop_runtime_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(report["targets"][0]["status"], "recovered")
+        self.assertEqual(
+            report["targets"][0]["actions"][0]["action"],
+            "model_capacity_retry_scheduled",
+        )
 
     def test_failed_turn_start_retries_after_fresh_resume(self) -> None:
         first_client = _FakeClient(fail_start=True)

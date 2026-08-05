@@ -43,6 +43,10 @@ class ConfigTests(unittest.TestCase):
                     "command": ["codex"],
                     "codex_home": "codex-home",
                     "allowed_sources": ["CLI"],
+                    "model_capacity_retry_limit": 10,
+                    "model_capacity_backoff_initial_seconds": 15,
+                    "model_capacity_backoff_max_seconds": 600,
+                    "model_capacity_fallback_models": ["gpt-fallback"],
                 }
             ],
         }
@@ -53,6 +57,41 @@ class ConfigTests(unittest.TestCase):
             config = load_config(path)
 
         self.assertEqual(config.targets[0].allowed_sources, ("cli",))
+        self.assertEqual(config.targets[0].model_capacity_retry_limit, 10)
+        self.assertEqual(
+            config.targets[0].model_capacity_backoff_initial_seconds, 15
+        )
+        self.assertEqual(
+            config.targets[0].model_capacity_backoff_max_seconds, 600
+        )
+        self.assertEqual(
+            config.targets[0].model_capacity_fallback_models,
+            ("gpt-fallback",),
+        )
+
+    def test_rejects_invalid_model_capacity_retry_policy(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "state_path": "state.json",
+            "log_path": "guardian.jsonl",
+            "targets": [
+                {
+                    "name": "wsl",
+                    "command": ["codex"],
+                    "codex_home": "codex-home",
+                    "model_capacity_retry_limit": 0,
+                    "model_capacity_fallback_models": ["gpt-fallback"],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "model_capacity_retry_limit"
+            ):
+                load_config(path)
 
     def test_loads_desktop_goal_state_mode(self) -> None:
         payload = {
