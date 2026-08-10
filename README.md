@@ -107,6 +107,33 @@ remain idempotent.
 The reconciliation prompt tells Codex to inspect recorded terminal state and
 avoid repeating successful commands or mutations.
 
+For native CLI targets and explicitly allowlisted Desktop targets, Guardian can
+also recover the exact persisted error
+`Selected model is at capacity. Please try a different model.` when
+`model_capacity_fallback_models` is non-empty. It first keeps the thread's
+current model and reasoning effort for 10 retries. Retries use persisted
+exponential backoff starting at 15 seconds and cap at 600 seconds. Only after
+the per-model retry limit is exhausted does Guardian pass the next explicitly
+configured model to `turn/start`; it never passes an `effort` override. The
+same active-Goal, idle-thread, source allowlist, process ownership, repeated
+read, and deterministic message-ID checks still apply.
+
+Configure the ordered fallback list on a `cli_turn` target or an allowlisted
+`desktop_goal_state` target. An empty list keeps capacity recovery disabled:
+
+```json
+{
+  "model_capacity_retry_limit": 10,
+  "model_capacity_backoff_initial_seconds": 15,
+  "model_capacity_backoff_max_seconds": 600,
+  "model_capacity_fallback_models": ["gpt-5.6-terra"]
+}
+```
+
+Index zero is always the thread's existing model, so the list contains only
+lower-priority fallbacks. Retry counters, the selected model slot, and
+`next_retry_at` are stored in Guardian state and survive watcher restarts.
+
 ## Upstream status
 
 This project works around open upstream gaps rather than claiming to fix the
@@ -163,6 +190,15 @@ The installer does not stop or restart Codex Desktop. After the current task is
 safely idle, close and reopen the app once so its new main process reads
 `CODEX_APP_SERVER_WS_URL`. That one restart is required when migrating from
 0.5.x; later Desktop app updates continue to inherit the user-level setting.
+
+If ChatGPT cannot open and its startup log shows `ECONNREFUSED` to the exact
+Guardian `CODEX_APP_SERVER_WS_URL`, run `doctor` first. When the shared listener
+is unavailable, use
+`%LOCALAPPDATA%\CodexGoalGuardian\desktop-environment-backup.json` to restore
+only the previous user environment value, then relaunch ChatGPT. This fail-open
+repair preserves app access but disables Desktop shared-runtime recovery until
+the listener is repaired and the Windows installer is rerun. It does not
+require stopping the WSL or native CLI Guardian.
 
 The legacy `request-desktop-recovery` heartbeat path remains available for
 installations that do not configure an allowlist. It is no longer recommended
@@ -309,6 +345,10 @@ and logs should also be deleted.
   Until then, the already-running app still owns its old embedded App Server
   and Guardian deliberately reports the shared runtime as unavailable.
 - Guardian cannot continue work that is waiting for user input or approval.
+- Model-capacity recovery is opt-in per CLI or allowlisted Desktop target and
+  requires at least one explicit fallback model. Guardian retries the thread's
+  existing model first, preserves its current reasoning effort, and fails
+  closed after every configured model exhausts its retry limit.
 - An incompatible future App Server schema fails closed; it never falls back
   to direct database edits or UI automation.
 - An explicit `desktop_thread_ids` entry opts that task into external wake.

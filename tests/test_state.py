@@ -10,7 +10,9 @@ from codex_goal_guardian.state import (
     enqueue_desktop_recovery_request,
     finish_desktop_recovery_request,
     mark_recovered,
+    model_capacity_recovery_record,
     pending_desktop_recovery_requests,
+    save_model_capacity_recovery,
     transition_health,
     was_recovered,
 )
@@ -123,6 +125,30 @@ class HealthTransitionTests(unittest.TestCase):
         self.assertTrue(was_recovered(state, "windows", 3, "thread-a"))
         self.assertFalse(was_recovered(state, "windows", 4, "thread-a"))
         self.assertFalse(was_recovered(state, "wsl", 3, "thread-a"))
+
+    def test_model_capacity_retry_record_is_persisted_per_thread(self) -> None:
+        state = default_state()
+        save_model_capacity_recovery(
+            state,
+            "wsl",
+            "thread-a",
+            {
+                "failure_turn_id": "turn-a",
+                "attempts_in_model": 3,
+                "next_retry_at": 600,
+            },
+            now=200,
+        )
+
+        self.assertEqual(
+            model_capacity_recovery_record(state, "wsl", "thread-a"),
+            {
+                "failure_turn_id": "turn-a",
+                "attempts_in_model": 3,
+                "next_retry_at": 600,
+                "recorded_at": 200,
+            },
+        )
 
     def test_desktop_recovery_request_coalesces_until_finished(self) -> None:
         state = default_state()

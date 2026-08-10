@@ -47,6 +47,7 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
             "desktop_request_generation": 0,
             "desktop_recovery_requests": {},
             "desktop_direct_recoveries": {},
+            "model_capacity_recoveries": {},
         },
     )
     target.setdefault("health", "unknown")
@@ -60,6 +61,7 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
     target.setdefault("desktop_request_generation", 0)
     target.setdefault("desktop_recovery_requests", {})
     target.setdefault("desktop_direct_recoveries", {})
+    target.setdefault("model_capacity_recoveries", {})
     return target
 
 
@@ -288,6 +290,51 @@ def mark_desktop_direct_recovery(
         "app_server_url": app_server_url,
         "recorded_at": int(time.time() if now is None else now),
     }
+
+
+def model_capacity_recovery_record(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+) -> dict[str, Any] | None:
+    records = _target_state(state, target_name)["model_capacity_recoveries"]
+    if not isinstance(records, dict):
+        raise StateCorruptionError(
+            "Guardian model capacity recovery records must be an object"
+        )
+    value = records.get(thread_id)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def save_model_capacity_recovery(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+    record: MutableMapping[str, Any],
+    *,
+    now: int | None = None,
+) -> None:
+    records = _target_state(state, target_name)["model_capacity_recoveries"]
+    if not isinstance(records, dict):
+        raise StateCorruptionError(
+            "Guardian model capacity recovery records must be an object"
+        )
+    records[thread_id] = {
+        **dict(record),
+        "recorded_at": int(time.time() if now is None else now),
+    }
+    if len(records) <= 64:
+        return
+    oldest = sorted(
+        (
+            int(value.get("recorded_at", 0)),
+            str(key),
+        )
+        for key, value in records.items()
+        if isinstance(value, dict)
+    )
+    for _, key in oldest[:-64]:
+        records.pop(key, None)
 
 
 def _prune_desktop_recovery_requests(

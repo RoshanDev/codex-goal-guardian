@@ -286,14 +286,18 @@ class AppServerClient:
         *,
         prompt: str,
         client_user_message_id: str,
+        model: str | None = None,
     ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+            "clientUserMessageId": client_user_message_id,
+        }
+        if model is not None:
+            params["model"] = model
         result = self.request(
             "turn/start",
-            {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt}],
-                "clientUserMessageId": client_user_message_id,
-            },
+            params,
         )
         return self._required_object(result, "turn", "turn/start")
 

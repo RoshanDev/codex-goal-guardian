@@ -50,6 +50,11 @@ class PluginPackagingTests(unittest.TestCase):
         self.assertIn("read-only session JSONL", skill)
         self.assertIn("one deterministic `turn/start`", skill)
         self.assertIn("generic completed-heartbeat entry", skill)
+        self.assertIn("model_capacity_fallback_models", skill)
+        self.assertIn("omitting `effort`", skill)
+        self.assertIn("persisted exponential", skill)
+        self.assertIn("desktop-environment-backup.json", skill)
+        self.assertIn("Do not stop a Windows/WSL Guardian", skill)
 
 
 if __name__ == "__main__":
