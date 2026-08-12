@@ -43,6 +43,9 @@ attempts, whether Guardian is installed, or how to inspect its recovery state.
 - Prefer `doctor`, `status`, and `run-once --dry-run` before live recovery.
 - Never externally wake an unlisted `source=vscode` desktop task.
 - Never recover while a matching native CLI process is still running.
+- Treat the exact platform `Invalid prompt: your prompt was flagged` response
+  as a terminal `prompt_policy_rejection`. Never replay it, search behind it
+  for older network evidence, or attempt to rewrite it to bypass policy.
 - Never patch the desktop app package, edit Codex session databases or JSONL
   logs, or delete Codex configuration, authentication, sessions, or project
   files.

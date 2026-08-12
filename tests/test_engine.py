@@ -63,6 +63,10 @@ def make_thread(
 MODEL_CAPACITY_ERROR = (
     "Selected model is at capacity. Please try a different model."
 )
+PROMPT_POLICY_ERROR = (
+    "Invalid prompt: your prompt was flagged as potentially violating our "
+    "usage policy. Please try again with a different prompt"
+)
 
 
 class EligibilityTests(unittest.TestCase):
@@ -136,6 +140,18 @@ class EligibilityTests(unittest.TestCase):
 
         self.assertFalse(eligible)
         self.assertEqual(reason, "turn_not_network_failure")
+
+    def test_prompt_policy_rejection_is_terminal(self) -> None:
+        eligible, reason = thread_eligibility(
+            make_thread(error_message=PROMPT_POLICY_ERROR),
+            self.goal,
+            self.target,
+            now=150,
+            already_recovered=False,
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "prompt_policy_rejection")
 
     def test_desktop_vscode_thread_is_rejected(self) -> None:
         eligible, reason = thread_eligibility(
@@ -264,6 +280,21 @@ class DesktopGoalReactivationEligibilityTests(unittest.TestCase):
 
         self.assertFalse(eligible)
         self.assertEqual(reason, "turn_not_network_failure")
+
+    def test_prompt_policy_rejection_is_never_reactivated(self) -> None:
+        eligible, reason = desktop_goal_reactivation_eligibility(
+            make_thread(
+                source="vscode",
+                error_message=PROMPT_POLICY_ERROR,
+            ),
+            self.goal,
+            self.target,
+            now=150,
+            already_recovered=False,
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "prompt_policy_rejection")
 
     def test_completed_heartbeat_after_network_failure_remains_eligible(
         self,

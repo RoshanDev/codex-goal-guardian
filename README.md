@@ -345,6 +345,11 @@ and logs should also be deleted.
   Until then, the already-running app still owns its old embedded App Server
   and Guardian deliberately reports the shared runtime as unavailable.
 - Guardian cannot continue work that is waiting for user input or approval.
+- A platform `Invalid prompt` policy rejection is terminal and is never
+  replayed automatically. Guardian reports `prompt_policy_rejection` instead
+  of searching past that turn for an older network failure. Continue such work
+  only from a newly written, policy-compliant request; Guardian does not try to
+  bypass or rewrite platform policy decisions.
 - Model-capacity recovery is opt-in per CLI or allowlisted Desktop target and
   requires at least one explicit fallback model. Guardian retries the thread's
   existing model first, preserves its current reasoning effort, and fails

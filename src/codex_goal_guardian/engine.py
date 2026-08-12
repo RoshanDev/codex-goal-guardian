@@ -67,6 +67,7 @@ _NETWORK_ERROR_MARKERS = (
     "websocket",
 )
 _MODEL_CAPACITY_ERROR_MARKER = "selected model is at capacity"
+_PROMPT_POLICY_ERROR_MARKER = "invalid prompt: your prompt was flagged"
 
 
 def looks_like_network_failure(thread: dict[str, Any]) -> bool:
@@ -97,6 +98,10 @@ def _error_text(error: dict[str, Any]) -> str:
 
 def _error_looks_like_model_capacity_failure(error: dict[str, Any]) -> bool:
     return _MODEL_CAPACITY_ERROR_MARKER in _error_text(error)
+
+
+def _error_looks_like_prompt_policy_rejection(error: dict[str, Any]) -> bool:
+    return _PROMPT_POLICY_ERROR_MARKER in _error_text(error)
 
 
 def looks_like_model_capacity_failure(
@@ -149,6 +154,11 @@ def thread_eligibility(
     turn_status = str(last_turn.get("status", "missing"))
     if turn_status not in {"failed", "interrupted"}:
         return False, f"turn_{turn_status}"
+    error = last_turn.get("error")
+    if isinstance(error, dict) and _error_looks_like_prompt_policy_rejection(
+        error
+    ):
+        return False, "prompt_policy_rejection"
     if not _turn_looks_like_network_failure(last_turn):
         return False, "turn_not_network_failure"
     return True, "eligible"
@@ -240,6 +250,8 @@ def desktop_goal_reactivation_eligibility(
         if turn_status in {"failed", "interrupted"}:
             return False, "turn_not_network_failure"
         return False, f"turn_{turn_status}"
+    if _error_looks_like_prompt_policy_rejection(error):
+        return False, "prompt_policy_rejection"
     if not _error_looks_like_network_failure(error):
         return False, "turn_not_network_failure"
     return True, "eligible"
@@ -2391,6 +2403,7 @@ def _verify_goal_reactivation(
 
 def _is_safety_rejection(reason: str) -> bool:
     return reason.startswith("source_") or reason in {
+        "prompt_policy_rejection",
         "turn_completed",
         "turn_not_network_failure",
     }
