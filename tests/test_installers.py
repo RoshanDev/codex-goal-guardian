@@ -28,6 +28,8 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("trap {", content)
         self.assertIn("Get-CimInstance Win32_Process", content)
         self.assertIn("/proc/[0-9]*/cmdline", content)
+        self.assertIn("is_guardian_watch_descendant", content)
+        self.assertIn("codex_goal_guardian*watch*--config", content)
         self.assertIn("Select-Object -First 1", content)
         self.assertIn("$ClearObservations -ge 2", content)
         self.assertIn("$ProbeFailureAnnounced", content)

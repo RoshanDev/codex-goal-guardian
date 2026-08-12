@@ -326,6 +326,24 @@ function Test-WslRecoveryProcess {
         -ErrorAction Stop | Select-Object -First 1
     $Probe = @'
 current=$$
+is_guardian_watch_descendant() {
+    child="$1"
+    depth=0
+    while [ "$depth" -lt 4 ]; do
+        [ -r "/proc/$child/stat" ] || return 1
+        parent=$(sed -E 's/^.*\) [^ ]+ ([0-9]+) .*$/\1/' "/proc/$child/stat")
+        [ -n "$parent" ] && [ "$parent" != "0" ] || return 1
+        [ -r "/proc/$parent/cmdline" ] || return 1
+        parent_line=$(tr '\000' ' ' < "/proc/$parent/cmdline" 2>/dev/null)
+        case "$parent_line" in
+            *codex_goal_guardian*watch*--config*) return 0 ;;
+            *codex-goal-guardian*watch*--config*) return 0 ;;
+        esac
+        child="$parent"
+        depth=$((depth + 1))
+    done
+    return 1
+}
 for path in /proc/[0-9]*/cmdline; do
     pid=${path#/proc/}
     pid=${pid%/cmdline}
@@ -333,7 +351,9 @@ for path in /proc/[0-9]*/cmdline; do
     [ -r "$path" ] || continue
     line=$(tr '\000' ' ' < "$path" 2>/dev/null)
     case "$line" in
-        *codex*app-server*) exit 0 ;;
+        *codex*app-server*)
+            is_guardian_watch_descendant "$pid" || exit 0
+            ;;
     esac
 done
 exit 1
