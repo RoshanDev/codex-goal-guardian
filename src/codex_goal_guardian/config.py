@@ -34,6 +34,7 @@ class TargetConfig:
     model_capacity_backoff_max_seconds: int = 600
     model_capacity_fallback_models: tuple[str, ...] = ()
     desktop_thread_ids: tuple[str, ...] = ()
+    prompt_policy_retry_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,9 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
         ),
         desktop_thread_ids=_desktop_thread_ids(
             data.get("desktop_thread_ids")
+        ),
+        prompt_policy_retry_enabled=bool(
+            data.get("prompt_policy_retry_enabled", False)
         ),
     )
 

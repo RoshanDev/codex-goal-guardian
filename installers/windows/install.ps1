@@ -110,6 +110,7 @@ function Update-GuardianConfig {
         Set-JsonProperty $Desktop "app_server_url" (
             $DesktopTarget["app_server_url"]
         )
+        Set-JsonProperty $Desktop "prompt_policy_retry_enabled" $true
         if ($ReplaceDesktopThreadIds) {
             Set-JsonProperty $Desktop "desktop_thread_ids" @(
                 $DesktopTarget["desktop_thread_ids"]
@@ -564,6 +565,7 @@ $DesktopGoalStateTarget = [ordered]@{
     resume_grace_seconds = if ($DesktopWakeEnabled) { 2 } else { 0 }
     start_recovery_turn = $DesktopWakeEnabled
     desktop_thread_ids = @($DesktopThreadIds)
+    prompt_policy_retry_enabled = $true
 }
 $Configuration = [ordered]@{
     schema_version = 1

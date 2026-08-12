@@ -68,6 +68,11 @@ _NETWORK_ERROR_MARKERS = (
 )
 _MODEL_CAPACITY_ERROR_MARKER = "selected model is at capacity"
 _PROMPT_POLICY_ERROR_MARKER = "invalid prompt: your prompt was flagged"
+_PROMPT_POLICY_RECOVERY_PROMPT = (
+    "Continue the active Goal from its current recorded state. Do not repeat "
+    "completed actions. Follow the user's existing objective and all "
+    "applicable policies."
+)
 
 
 def looks_like_network_failure(thread: dict[str, Any]) -> bool:
@@ -251,6 +256,8 @@ def desktop_goal_reactivation_eligibility(
             return False, "turn_not_network_failure"
         return False, f"turn_{turn_status}"
     if _error_looks_like_prompt_policy_rejection(error):
+        if target.prompt_policy_retry_enabled:
+            return True, "prompt_policy_retry"
         return False, "prompt_policy_rejection"
     if not _error_looks_like_network_failure(error):
         return False, "turn_not_network_failure"
@@ -1117,6 +1124,8 @@ class RecoveryEngine:
                             )
                             continue
 
+                        prompt_policy_retry = reason == "prompt_policy_retry"
+
                         candidate = _desktop_recovery_candidate_turn(
                             thread,
                             pending_evidence_turn_id=(
@@ -1145,6 +1154,21 @@ class RecoveryEngine:
                                 target.name,
                                 thread_id,
                             )
+                            if (
+                                prompt_policy_retry
+                                and isinstance(record, dict)
+                                and record.get("recovery_turn_id")
+                                == candidate_id
+                            ):
+                                report["skipped"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "reason": (
+                                            "prompt_policy_retry_exhausted"
+                                        ),
+                                    }
+                                )
+                                continue
                             if (
                                 isinstance(record, dict)
                                 and record.get("turn_id") == candidate_id
@@ -1197,7 +1221,8 @@ class RecoveryEngine:
                             action = {
                                 "thread_id": thread_id,
                                 "action": "would_reactivate_goal",
-                                "network_failure": True,
+                                "network_failure": not prompt_policy_retry,
+                                "prompt_policy_retry": prompt_policy_retry,
                                 "same_runtime_wake_required": not (
                                     direct and target.start_recovery_turn
                                 ),
@@ -1247,6 +1272,17 @@ class RecoveryEngine:
                                 {
                                     "thread_id": thread_id,
                                     "reason": fresh_reason,
+                                    "stage": "pre_mutation",
+                                }
+                            )
+                            continue
+                        if prompt_policy_retry != (
+                            fresh_reason == "prompt_policy_retry"
+                        ):
+                            report["skipped"].append(
+                                {
+                                    "thread_id": thread_id,
+                                    "reason": "recovery_evidence_changed",
                                     "stage": "pre_mutation",
                                 }
                             )
@@ -1369,17 +1405,29 @@ class RecoveryEngine:
                         report["actions"].append(action)
                         if direct and target.start_recovery_turn:
                             assert isinstance(fresh_candidate_id, str)
-                            self._wake_direct_desktop_goal(
-                                client,
-                                target,
-                                thread_id,
-                                fresh_candidate_id,
-                                recovery_prompt,
-                                state,
-                                store,
-                                report,
-                                now,
-                            )
+                            if prompt_policy_retry:
+                                self._start_prompt_policy_continuation(
+                                    client,
+                                    target,
+                                    thread_id,
+                                    fresh_candidate_id,
+                                    state,
+                                    store,
+                                    report,
+                                    now,
+                                )
+                            else:
+                                self._wake_direct_desktop_goal(
+                                    client,
+                                    target,
+                                    thread_id,
+                                    fresh_candidate_id,
+                                    recovery_prompt,
+                                    state,
+                                    store,
+                                    report,
+                                    now,
+                                )
                     except Exception as error:
                         had_error = True
                         report["errors"].append(
@@ -1394,6 +1442,97 @@ class RecoveryEngine:
             )
             return False
         return not had_error and not recovery_waiting
+
+    def _start_prompt_policy_continuation(
+        self,
+        client: Any,
+        target: TargetConfig,
+        thread_id: str,
+        evidence_turn_id: str,
+        state: dict[str, Any],
+        store: StateStore,
+        report: dict[str, Any],
+        now: int,
+    ) -> None:
+        current_thread = client.read_thread(thread_id, include_turns=True)
+        current_goal = client.get_goal(thread_id)
+        if (
+            not isinstance(current_goal, dict)
+            or current_goal.get("status") != "active"
+        ):
+            report["skipped"].append(
+                {"thread_id": thread_id, "reason": "goal_changed_before_wake"}
+            )
+            return
+        if _thread_or_turn_active(current_thread):
+            report["skipped"].append(
+                {"thread_id": thread_id, "reason": "turn_in_progress"}
+            )
+            return
+
+        message_id = _desktop_recovery_message_id(
+            target.name,
+            evidence_turn_id,
+            thread_id,
+        )
+        turn = client.start_turn(
+            thread_id,
+            prompt=_PROMPT_POLICY_RECOVERY_PROMPT,
+            client_user_message_id=message_id,
+        )
+        recovery_turn_id = turn.get("id")
+        normalized_turn_id = (
+            str(recovery_turn_id) if recovery_turn_id is not None else None
+        )
+        mark_desktop_direct_recovery(
+            state,
+            target.name,
+            thread_id,
+            turn_id=evidence_turn_id,
+            action="prompt_policy_turn_started",
+            recovery_turn_id=normalized_turn_id,
+            app_server_url=target.app_server_url,
+            now=now,
+        )
+        store.save(state)
+        report["actions"].append(
+            {
+                "thread_id": thread_id,
+                "action": "prompt_policy_continuation_started",
+                "turn_id": normalized_turn_id,
+                "client_user_message_id": message_id,
+                "mode": "direct",
+            }
+        )
+        _, goal_after_turn = self._wait_until_settled(
+            client,
+            thread_id,
+            target,
+        )
+        mark_desktop_direct_recovery(
+            state,
+            target.name,
+            thread_id,
+            turn_id=evidence_turn_id,
+            action="prompt_policy_turn_settled",
+            recovery_turn_id=normalized_turn_id,
+            app_server_url=target.app_server_url,
+            now=now,
+        )
+        store.save(state)
+        report["actions"].append(
+            {
+                "thread_id": thread_id,
+                "action": "prompt_policy_continuation_settled",
+                "turn_id": normalized_turn_id,
+                "goal_status": (
+                    goal_after_turn.get("status")
+                    if isinstance(goal_after_turn, dict)
+                    else None
+                ),
+                "mode": "direct",
+            }
+        )
 
     def _wake_direct_desktop_goal(
         self,

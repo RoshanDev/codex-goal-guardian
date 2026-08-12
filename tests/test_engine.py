@@ -296,6 +296,32 @@ class DesktopGoalReactivationEligibilityTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertEqual(reason, "prompt_policy_rejection")
 
+    def test_prompt_policy_rejection_is_retryable_when_enabled(self) -> None:
+        target = TargetConfig(
+            name=self.target.name,
+            command=self.target.command,
+            codex_home=self.target.codex_home,
+            recovery_mode=self.target.recovery_mode,
+            allowed_sources=self.target.allowed_sources,
+            max_thread_age_seconds=self.target.max_thread_age_seconds,
+            start_recovery_turn=True,
+            desktop_thread_ids=("thread-1",),
+            prompt_policy_retry_enabled=True,
+        )
+        eligible, reason = desktop_goal_reactivation_eligibility(
+            make_thread(
+                source="vscode",
+                error_message=PROMPT_POLICY_ERROR,
+            ),
+            self.goal,
+            target,
+            now=150,
+            already_recovered=False,
+        )
+
+        self.assertTrue(eligible)
+        self.assertEqual(reason, "prompt_policy_retry")
+
     def test_completed_heartbeat_after_network_failure_remains_eligible(
         self,
     ) -> None:
@@ -541,6 +567,7 @@ class _FakeClient:
         self.resume_calls = 0
         self.start_calls = 0
         self.start_models: list[str | None] = []
+        self.start_prompts: list[str] = []
         self.reactivate_calls = 0
         self.read_calls = 0
         self.list_calls = 0
@@ -588,6 +615,7 @@ class _FakeClient:
     ) -> dict:
         self.start_calls += 1
         self.start_models.append(model)
+        self.start_prompts.append(prompt)
         if self.fail_start:
             raise AppServerError("simulated turn/start failure")
         return {"id": "turn-recovery", "status": "inProgress"}
@@ -1445,6 +1473,139 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual(record["turn_id"], "turn-1")
         self.assertEqual(record["action"], "turn_settled")
         self.assertEqual(record["recovery_turn_id"], "turn-recovery")
+
+    def test_desktop_policy_rejection_starts_one_fresh_continuation(self) -> None:
+        desktop_target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=100,
+            resume_grace_seconds=0,
+            start_recovery_turn=True,
+            desktop_thread_ids=("thread-1",),
+            prompt_policy_retry_enabled=True,
+        )
+        goal = {
+            "threadId": "thread-1",
+            "objective": "finish safely",
+            "status": "blocked",
+            "tokenBudget": 40_000,
+            "tokensUsed": 1234,
+            "timeUsedSeconds": 5678,
+            "createdAt": 90,
+            "updatedAt": 110,
+        }
+        desktop = make_thread(
+            source="vscode",
+            error_message=PROMPT_POLICY_ERROR,
+        )
+        client = _FakeClient(listed_thread=desktop, goal=goal)
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(desktop_target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(client.reactivate_calls, 1)
+        self.assertEqual(client.resume_calls, 0)
+        self.assertEqual(client.start_calls, 1)
+        self.assertNotEqual(client.start_prompts[0], config.recovery_prompt)
+        self.assertEqual(
+            [action["action"] for action in report["targets"][0]["actions"]],
+            [
+                "goal_state_reactivated",
+                "prompt_policy_continuation_started",
+                "prompt_policy_continuation_settled",
+            ],
+        )
+
+        retry_client = _FakeClient(listed_thread=desktop, goal=goal)
+        retry_report = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: retry_client,
+            process_probe=lambda _: True,
+            now=lambda: 121,
+            sleep=lambda _: None,
+        ).run_once(config)
+        self.assertEqual(retry_client.start_calls, 0)
+        self.assertEqual(
+            retry_report["targets"][0]["skipped"][0]["reason"],
+            "already_recovered_turn",
+        )
+
+    def test_desktop_policy_continuation_rejection_exhausts_retry(self) -> None:
+        desktop_target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=100,
+            start_recovery_turn=True,
+            desktop_thread_ids=("thread-1",),
+            prompt_policy_retry_enabled=True,
+        )
+        state = self.store.load()
+        mark_desktop_direct_recovery(
+            state,
+            desktop_target.name,
+            "thread-1",
+            turn_id="original-policy-turn",
+            action="prompt_policy_turn_settled",
+            recovery_turn_id="turn-1",
+            now=115,
+        )
+        self.store.save(state)
+        desktop = make_thread(
+            source="vscode",
+            error_message=PROMPT_POLICY_ERROR,
+        )
+        goal = {
+            "threadId": "thread-1",
+            "objective": "finish safely",
+            "status": "blocked",
+            "tokenBudget": 40_000,
+            "tokensUsed": 1234,
+            "timeUsedSeconds": 5678,
+            "createdAt": 90,
+            "updatedAt": 110,
+        }
+        client = _FakeClient(listed_thread=desktop, goal=goal)
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(desktop_target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+
+        report = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: True,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        ).run_once(config)
+
+        self.assertEqual(client.reactivate_calls, 0)
+        self.assertEqual(client.start_calls, 0)
+        self.assertEqual(
+            report["targets"][0]["skipped"][0]["reason"],
+            "prompt_policy_retry_exhausted",
+        )
 
     def test_desktop_direct_watch_finishes_pending_active_goal_wake(
         self,
