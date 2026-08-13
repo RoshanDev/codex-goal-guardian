@@ -30,10 +30,11 @@ supported App Server WebSocket setting and never patches the package. It acts
 only on an explicitly allowlisted task after the shared runtime has left it
 idle because of an exact persisted network failure.
 
-Windows Task Scheduler launches 15-second native Windows and WSL CLI watchers;
-an optional WSL user timer is a fallback. A fourth Windows task hosts the
-shared loopback App Server, and a one-minute watchdog restarts the server or
-either watcher if it exits. All four Windows tasks enter through
+Windows Task Scheduler launches isolated 15-second Desktop and native Windows
+watchers plus the WSL CLI watcher; an optional WSL user timer is a fallback. A
+fourth Windows task hosts the shared loopback App Server, and a fifth task is
+the one-minute watchdog that restarts the server or any watcher if it exits.
+All five Windows tasks enter through
 `pythonw.exe`; App Server, WSL, and PowerShell children use the Windows
 `CREATE_NO_WINDOW` flag, so scheduled monitoring does not leave visible
 console windows. The standalone runtime is copied to:
@@ -41,7 +42,10 @@ console windows. The standalone runtime is copied to:
 - Windows: `%LOCALAPPDATA%\CodexGoalGuardian`
 - WSL2: `~/.local/share/codex-goal-guardian`
 
-During an in-place upgrade the installer holds a local maintenance marker.
+During an in-place upgrade the installer writes Windows and WSL maintenance
+markers before draining. Watchers finish their current bounded pass, pause
+before starting another one, and are then replaced, so passive App Server scans
+cannot keep an upgrade waiting forever.
 The watchdog exits quietly while that marker belongs to a live installer, so
 it cannot restart an old watcher during runtime replacement. A stale marker is
 removed automatically after an interrupted installer exits.
@@ -58,7 +62,11 @@ contract. When `delegated_continuity_enabled` is explicitly enabled, the
 allowlist is also the durable delegation boundary: an idle `source=vscode`
 Goal is continued after completed, failed, interrupted, blocked, or
 usage-limited turns until the Goal becomes complete, paused/cancelled, or
-budget-limited. It never wakes an `inProgress` turn. Codex App Server can
+budget-limited. A progressing `inProgress` turn is left alone. For an
+allowlisted Desktop Goal, Guardian persists a liveness fingerprint from
+authoritative thread recency and Goal accounting; only an unchanged active
+turn older than the configured stall window is interrupted through
+`turn/interrupt`. Codex App Server can
 normalize some failed remote-compaction turns to `completed`; Guardian can
 also check matching `task_complete` evidence in the read-only session JSONL.
 
@@ -73,8 +81,23 @@ accounting, and creation time were preserved, and records the failure turn ID.
 It then waits, reads thread and Goal twice again, calls `thread/resume`, and
 allows the desktop runtime two more observations to wake itself. If the task
 remains idle, Guardian starts exactly one continuation using a deterministic
-client message ID and stays attached until that turn settles. The same failed
-turn cannot start the same continuation twice.
+client message ID. It records the started Desktop turn and immediately returns
+to its supervision loop, so a long Goal cannot occupy the only watcher. The
+same failed turn cannot start the same continuation twice.
+
+Windows Desktop and native Windows CLI supervision use isolated config/state
+lanes and scheduled tasks. A long CLI recovery can therefore keep its stdio
+App Server attached without starving Desktop liveness checks. If a confirmed
+stale Desktop interrupt RPC cannot complete, Guardian writes a narrow local
+restart request; the independent watchdog restarts only the Guardian-owned
+shared App Server and lets persisted Goal continuation reconcile normally.
+
+The installer defaults `desktop_stall_timeout_seconds` to 300 seconds. An
+active command/tool item receives the harder
+`desktop_operation_stall_timeout_seconds` default of 1800 seconds. A fresh
+pre-interrupt read cancels recovery whenever activity changed. Set the soft
+timeout to `0` to disable active-turn convergence while retaining ordinary
+idle/blocked/network recovery.
 
 This direct watcher is ordinary local code. Its probes, state checks, and
 Goal-state mutation do not create model turns or consume tokens. The actual
@@ -358,6 +381,9 @@ and logs should also be deleted.
   target with `prompt_policy_retry_enabled`, Guardian may send one new fixed,
   policy-compliant continuation for that rejected turn. A second rejection is
   reported as `prompt_policy_retry_exhausted` and requires manual handling.
+- The Desktop liveness supervisor does not trust elapsed UI time or historical
+  subagent `started` rows. It uses current thread recency/Goal accounting and a
+  fresh full-thread read before interrupting the actual latest active turn.
 - Model-capacity recovery is opt-in per CLI or allowlisted Desktop target and
   requires at least one explicit fallback model. Guardian retries the thread's
   existing model first, preserves its current reasoning effort, and fails
@@ -375,9 +401,9 @@ subscriber-presence signal leaves a small residual ownership race.
   starts at most one deterministic continuation for that turn. Any matching
   live native CLI process delays takeover, including a different task using
   that same configured executable.
-- One supervisor lease is held for the lifetime of a watcher or `run-once`
-  pass. Duplicate Windows/WSL schedulers report `supervisor_already_active`
-  without delaying the active supervisor.
+- One supervisor lease is held per isolated state lane for the lifetime of a
+  watcher or `run-once` pass. Duplicate schedulers report
+  `supervisor_already_active` without delaying the active supervisor.
 - Health restoration must be observed by the scheduler. Installing while the
   network is already healthy does not synthesize an outage.
 

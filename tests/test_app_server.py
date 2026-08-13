@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codex_goal_guardian.app_server import (
     AppServerClient,
@@ -35,6 +36,9 @@ class AppServerClientTests(unittest.TestCase):
             reactivated = self.client.reactivate_goal("thread-1")
             loaded = self.client.read_thread("thread-1", include_turns=True)
             resumed = self.client.resume_thread("thread-1")
+            interrupted = self.client.interrupt_turn(
+                "thread-1", "turn-active"
+            )
             started_default = self.client.start_turn(
                 "thread-1",
                 prompt="reconcile and continue",
@@ -52,6 +56,7 @@ class AppServerClientTests(unittest.TestCase):
         self.assertEqual(reactivated["status"], "active")
         self.assertEqual(loaded["turns"][-1]["status"], "failed")
         self.assertEqual(resumed["id"], "thread-1")
+        self.assertIsNone(interrupted)
         self.assertEqual(started_default["id"], "turn-recovery")
         self.assertEqual(started["id"], "turn-recovery")
 
@@ -70,6 +75,7 @@ class AppServerClientTests(unittest.TestCase):
                 "thread/goal/set",
                 "thread/read",
                 "thread/resume",
+                "turn/interrupt",
                 "turn/start",
                 "turn/start",
             ],
@@ -77,6 +83,10 @@ class AppServerClientTests(unittest.TestCase):
         self.assertEqual(
             messages[4]["params"],
             {"threadId": "thread-1", "status": "active"},
+        )
+        self.assertEqual(
+            messages[7]["params"],
+            {"threadId": "thread-1", "turnId": "turn-active"},
         )
         default_turn_params = messages[-2]["params"]
         self.assertNotIn("model", default_turn_params)
@@ -96,6 +106,21 @@ class AppServerClientTests(unittest.TestCase):
                 self.client.request("hang", {})
 
         self.assertIn("timed out", str(context.exception))
+
+    def test_interrupt_uses_shorter_bounded_timeout(self) -> None:
+        with self.client:
+            with mock.patch.object(
+                self.client,
+                "_request",
+                return_value={},
+            ) as request:
+                self.client.interrupt_turn("thread-1", "turn-1")
+
+        request.assert_called_once_with(
+            "turn/interrupt",
+            {"threadId": "thread-1", "turnId": "turn-1"},
+            timeout_seconds=30,
+        )
 
     def test_protocol_error_includes_method(self) -> None:
         with self.client:

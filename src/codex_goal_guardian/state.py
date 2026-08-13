@@ -47,6 +47,7 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
             "desktop_request_generation": 0,
             "desktop_recovery_requests": {},
             "desktop_direct_recoveries": {},
+            "desktop_active_observations": {},
             "model_capacity_recoveries": {},
             "delegated_cli_recoveries": {},
         },
@@ -62,6 +63,7 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
     target.setdefault("desktop_request_generation", 0)
     target.setdefault("desktop_recovery_requests", {})
     target.setdefault("desktop_direct_recoveries", {})
+    target.setdefault("desktop_active_observations", {})
     target.setdefault("model_capacity_recoveries", {})
     target.setdefault("delegated_cli_recoveries", {})
     return target
@@ -294,6 +296,59 @@ def mark_desktop_direct_recovery(
     }
 
 
+def desktop_active_observation(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+) -> dict[str, Any] | None:
+    records = _target_state(state, target_name)[
+        "desktop_active_observations"
+    ]
+    if not isinstance(records, dict):
+        raise StateCorruptionError(
+            "Guardian desktop active observations must be an object"
+        )
+    value = records.get(thread_id)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def save_desktop_active_observation(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+    record: MutableMapping[str, Any],
+    *,
+    now: int | None = None,
+) -> None:
+    records = _target_state(state, target_name)[
+        "desktop_active_observations"
+    ]
+    if not isinstance(records, dict):
+        raise StateCorruptionError(
+            "Guardian desktop active observations must be an object"
+        )
+    records[thread_id] = {
+        **dict(record),
+        "recorded_at": int(time.time() if now is None else now),
+    }
+    _prune_timestamped_records(records)
+
+
+def clear_desktop_active_observation(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+) -> bool:
+    records = _target_state(state, target_name)[
+        "desktop_active_observations"
+    ]
+    if not isinstance(records, dict):
+        raise StateCorruptionError(
+            "Guardian desktop active observations must be an object"
+        )
+    return records.pop(thread_id, None) is not None
+
+
 def model_capacity_recovery_record(
     state: MutableMapping[str, Any],
     target_name: str,
@@ -325,18 +380,7 @@ def save_model_capacity_recovery(
         **dict(record),
         "recorded_at": int(time.time() if now is None else now),
     }
-    if len(records) <= 64:
-        return
-    oldest = sorted(
-        (
-            int(value.get("recorded_at", 0)),
-            str(key),
-        )
-        for key, value in records.items()
-        if isinstance(value, dict)
-    )
-    for _, key in oldest[:-64]:
-        records.pop(key, None)
+    _prune_timestamped_records(records)
 
 
 def delegated_cli_recovery_record(
@@ -368,14 +412,20 @@ def save_delegated_cli_recovery(
         **dict(record),
         "recorded_at": int(time.time() if now is None else now),
     }
-    if len(records) <= 64:
+    _prune_timestamped_records(records)
+
+
+def _prune_timestamped_records(
+    records: MutableMapping[str, Any], *, limit: int = 64
+) -> None:
+    if len(records) <= limit:
         return
     oldest = sorted(
         (int(value.get("recorded_at", 0)), str(key))
         for key, value in records.items()
         if isinstance(value, dict)
     )
-    for _, key in oldest[:-64]:
+    for _, key in oldest[:-limit]:
         records.pop(key, None)
 
 

@@ -24,6 +24,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $TaskWindows = "CodexGoalGuardian-Windows"
+$TaskDesktop = "CodexGoalGuardian-Desktop"
 $TaskWsl = "CodexGoalGuardian-WSL"
 $TaskWatchdog = "CodexGoalGuardian-Watchdog"
 $TaskAppServer = "CodexGoalGuardian-AppServer"
@@ -31,14 +32,29 @@ $SourceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $InstallRoot = Join-Path $env:LOCALAPPDATA "CodexGoalGuardian"
 $RuntimeRoot = Join-Path $InstallRoot "runtime"
 $ConfigPath = Join-Path $InstallRoot "config.json"
+$DesktopConfigPath = Join-Path $InstallRoot "config-desktop.json"
+$WindowsConfigPath = Join-Path $InstallRoot "config-windows.json"
 $StatePath = Join-Path $InstallRoot "state.json"
+$DesktopStatePath = Join-Path $InstallRoot "state-desktop.json"
+$WindowsStatePath = Join-Path $InstallRoot "state-windows.json"
 $LogPath = Join-Path $InstallRoot "guardian.jsonl"
+$DesktopLogPath = Join-Path $InstallRoot "guardian-desktop.jsonl"
+$WindowsLogPath = Join-Path $InstallRoot "guardian-windows.jsonl"
 $EnvironmentBackupPath = Join-Path $InstallRoot "desktop-environment-backup.json"
+$MaintenancePath = Join-Path $InstallRoot "maintenance.lock"
+$WslMaintenancePath = $null
+$TasksToRestore = @()
 $SharedAppServerListenUrl = "ws://127.0.0.1:$AppServerPort"
 $SharedAppServerUrl = "ws://127.0.0.1:$AppServerPort/rpc"
 
 if (-not $SkipWslTask -and [string]::IsNullOrWhiteSpace($WslUser)) {
     throw "Pass -WslUser with the native Linux user for $WslDistro."
+}
+if (-not $SkipWslTask) {
+    $WslMaintenancePath = (
+        "\\wsl.localhost\$WslDistro\home\$WslUser\.local\state\" +
+        "codex-goal-guardian\maintenance.lock"
+    )
 }
 
 $ReplaceDesktopThreadIds = $PSBoundParameters.ContainsKey("DesktopThreadId")
@@ -112,6 +128,12 @@ function Update-GuardianConfig {
         )
         Set-JsonProperty $Desktop "prompt_policy_retry_enabled" $true
         Set-JsonProperty $Desktop "delegated_continuity_enabled" $true
+        Set-JsonProperty $Desktop "desktop_stall_timeout_seconds" (
+            $DesktopTarget["desktop_stall_timeout_seconds"]
+        )
+        Set-JsonProperty $Desktop "desktop_operation_stall_timeout_seconds" (
+            $DesktopTarget["desktop_operation_stall_timeout_seconds"]
+        )
         if ($ReplaceDesktopThreadIds) {
             Set-JsonProperty $Desktop "desktop_thread_ids" @(
                 $DesktopTarget["desktop_thread_ids"]
@@ -174,6 +196,77 @@ function Update-GuardianConfig {
         }
     }
     Write-Plan "migrated update-safe desktop Goal recovery in $Path"
+}
+
+function Write-GuardianLaneConfig {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [string]$TargetName,
+        [string]$LaneStatePath,
+        [string]$LaneLogPath
+    )
+
+    $Source = Get-Content -LiteralPath $SourcePath -Raw | ConvertFrom-Json
+    $Matches = @(
+        @($Source.targets) | Where-Object { $_.name -eq $TargetName }
+    )
+    if ($Matches.Count -ne 1) {
+        throw "Expected exactly one $TargetName target in $SourcePath."
+    }
+    $Lane = [ordered]@{
+        schema_version = 1
+        state_path = $LaneStatePath
+        log_path = $LaneLogPath
+        health = $Source.health
+        targets = @($Matches[0])
+        recovery_prompt = $Source.recovery_prompt
+    }
+    $TemporaryPath = "$DestinationPath.tmp.$PID"
+    try {
+        $Lane | ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath $TemporaryPath -Encoding UTF8
+        $null = Get-Content -LiteralPath $TemporaryPath -Raw |
+            ConvertFrom-Json
+        Move-Item -LiteralPath $TemporaryPath `
+            -Destination $DestinationPath -Force
+    } finally {
+        if (Test-Path -LiteralPath $TemporaryPath) {
+            Remove-Item -LiteralPath $TemporaryPath -Force
+        }
+    }
+    Write-Plan "wrote isolated $TargetName lane at $DestinationPath"
+}
+
+function Initialize-GuardianLaneState {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [string]$TargetName
+    )
+
+    if (Test-Path -LiteralPath $DestinationPath) {
+        return
+    }
+    $Targets = [ordered]@{}
+    if (Test-Path -LiteralPath $SourcePath) {
+        $Source = Get-Content -LiteralPath $SourcePath -Raw |
+            ConvertFrom-Json
+        if ($Source.schema_version -ne 1) {
+            throw "Cannot seed lane from unsupported state at $SourcePath."
+        }
+        $Property = $Source.targets.PSObject.Properties[$TargetName]
+        if ($null -ne $Property) {
+            $Targets[$TargetName] = $Property.Value
+        }
+    }
+    $LaneState = [ordered]@{
+        schema_version = 1
+        targets = $Targets
+    }
+    $LaneState | ConvertTo-Json -Depth 12 |
+        Set-Content -LiteralPath $DestinationPath -Encoding UTF8
+    Write-Plan "initialized isolated state at $DestinationPath"
 }
 
 function Publish-EnvironmentChange {
@@ -281,7 +374,13 @@ function Test-WindowsRecoveryProcess {
         [string]$SharedUrl
     )
 
-    foreach ($Process in @(Get-CimInstance Win32_Process)) {
+    $Processes = @(Get-CimInstance Win32_Process)
+    $ProcessById = @{}
+    foreach ($Candidate in $Processes) {
+        $ProcessById[[int]$Candidate.ProcessId] = $Candidate
+    }
+
+    foreach ($Process in $Processes) {
         if ($Process.ProcessId -eq $PID -or
             [string]::IsNullOrWhiteSpace($Process.CommandLine)) {
             continue
@@ -312,8 +411,32 @@ function Test-WindowsRecoveryProcess {
                 break
             }
         }
-        if ($MatchesCommand) {
-            return $true
+        if (-not $MatchesCommand) {
+            continue
+        }
+
+        $Descendant = $Process
+        foreach ($Depth in 1..8) {
+            $ParentId = [int]$Descendant.ParentProcessId
+            if (-not $ProcessById.ContainsKey($ParentId)) {
+                break
+            }
+            $Parent = $ProcessById[$ParentId]
+            $ParentLine = [string]$Parent.CommandLine
+            if (
+                -not [string]::IsNullOrWhiteSpace($ParentLine) -and
+                $ParentLine.IndexOf(
+                    "guardian-launch.py",
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -ge 0 -and
+                $ParentLine.IndexOf(
+                    " watch --config ",
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -ge 0
+            ) {
+                return $true
+            }
+            $Descendant = $Parent
         }
     }
     return $false
@@ -569,6 +692,8 @@ $DesktopGoalStateTarget = [ordered]@{
     desktop_thread_ids = @($DesktopThreadIds)
     prompt_policy_retry_enabled = $true
     delegated_continuity_enabled = $true
+    desktop_stall_timeout_seconds = 300
+    desktop_operation_stall_timeout_seconds = 1800
 }
 $Configuration = [ordered]@{
     schema_version = 1
@@ -603,9 +728,12 @@ $Configuration = [ordered]@{
 if ($DryRun) {
     Write-Plan "dry-run: copy runtime to $RuntimeRoot"
     Write-Plan "dry-run: write configuration to $ConfigPath"
+    Write-Plan "dry-run: write isolated Desktop configuration to $DesktopConfigPath"
+    Write-Plan "dry-run: write isolated Windows CLI configuration to $WindowsConfigPath"
     Write-Plan "dry-run: set CODEX_APP_SERVER_WS_URL=$SharedAppServerUrl"
     if (-not $SkipTasks) {
         Write-Plan "dry-run: register $TaskAppServer"
+        Write-Plan "dry-run: register $TaskDesktop"
         Write-Plan "dry-run: register $TaskWindows"
         if (-not $SkipWslTask) {
             Write-Plan "dry-run: register $TaskWsl for $WslDistro"
@@ -615,21 +743,45 @@ if ($DryRun) {
     exit 0
 }
 
+New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+Set-Content -LiteralPath $MaintenancePath -Encoding ASCII -Value $PID
+if ($null -ne $WslMaintenancePath) {
+    New-Item -ItemType Directory `
+        -Path (Split-Path -Parent $WslMaintenancePath) `
+        -Force | Out-Null
+    Set-Content -LiteralPath $WslMaintenancePath `
+        -Encoding ASCII -Value $PID
+}
+trap {
+    $InstallFailure = $_
+    Remove-Item -LiteralPath $MaintenancePath -Force `
+        -ErrorAction SilentlyContinue
+    if ($null -ne $WslMaintenancePath) {
+        Remove-Item -LiteralPath $WslMaintenancePath -Force `
+            -ErrorAction SilentlyContinue
+    }
+    foreach ($TaskName in $TasksToRestore) {
+        Start-ScheduledTask -TaskName $TaskName `
+            -ErrorAction SilentlyContinue
+    }
+    throw $InstallFailure
+}
+
 Wait-GuardianRecoveryDrain -WindowsCommand $GuardianCommand `
     -Distro $WslDistro -LinuxUser $WslUser `
     -SharedUrl $SharedAppServerListenUrl `
     -SkipWsl:$SkipWslTask -TimeoutMinutes $DrainTimeoutMinutes
 
-$MaintenancePath = Join-Path $InstallRoot "maintenance.lock"
-New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
-Set-Content -LiteralPath $MaintenancePath -Encoding ASCII -Value $PID
-trap {
-    Remove-Item -LiteralPath $MaintenancePath -Force `
-        -ErrorAction SilentlyContinue
-    throw
+$OwnedTasks = @(
+    $TaskWatchdog,
+    $TaskDesktop,
+    $TaskWindows
+)
+if (-not $SkipWslTask) {
+    $OwnedTasks += $TaskWsl
 }
-
-foreach ($OwnedTask in @($TaskWatchdog, $TaskWindows, $TaskWsl)) {
+$TasksToRestore = @($OwnedTasks)
+foreach ($OwnedTask in $OwnedTasks) {
     $ExistingTask = Get-ScheduledTask -TaskName $OwnedTask -ErrorAction SilentlyContinue
     if ($null -ne $ExistingTask -and $ExistingTask.State -eq "Running") {
         Stop-ScheduledTask -TaskName $OwnedTask
@@ -639,13 +791,17 @@ Stop-DetachedGuardianWatchers -Runtime $RuntimeRoot `
     -Distro $WslDistro -LinuxUser $WslUser -SkipWsl:$SkipWslTask
 
 New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
-if (Test-Path -LiteralPath $RuntimeRoot) {
-    Remove-Item -LiteralPath $RuntimeRoot -Recurse -Force
-}
 New-Item -ItemType Directory -Path $RuntimeRoot -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $SourceRoot "src") -Destination $RuntimeRoot -Recurse
-Copy-Item -LiteralPath (Join-Path $SourceRoot "scripts") -Destination $RuntimeRoot -Recurse
-Copy-Item -LiteralPath (Join-Path $SourceRoot "pyproject.toml") -Destination $RuntimeRoot
+$RuntimeSource = Join-Path $RuntimeRoot "src"
+$RuntimeScripts = Join-Path $RuntimeRoot "scripts"
+New-Item -ItemType Directory -Path $RuntimeSource -Force | Out-Null
+New-Item -ItemType Directory -Path $RuntimeScripts -Force | Out-Null
+Copy-Item -Path (Join-Path $SourceRoot "src\*") `
+    -Destination $RuntimeSource -Recurse -Force
+Copy-Item -Path (Join-Path $SourceRoot "scripts\*") `
+    -Destination $RuntimeScripts -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $SourceRoot "pyproject.toml") `
+    -Destination $RuntimeRoot -Force
 
 if ($ForceConfig -or -not (Test-Path -LiteralPath $ConfigPath)) {
     $Configuration | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
@@ -655,15 +811,30 @@ if ($ForceConfig -or -not (Test-Path -LiteralPath $ConfigPath)) {
         -DesktopTarget $DesktopGoalStateTarget `
         -ReplaceDesktopThreadIds $ReplaceDesktopThreadIds
 }
+Write-GuardianLaneConfig -SourcePath $ConfigPath `
+    -DestinationPath $DesktopConfigPath `
+    -TargetName "windows-desktop-goal-state" `
+    -LaneStatePath $DesktopStatePath -LaneLogPath $DesktopLogPath
+Write-GuardianLaneConfig -SourcePath $ConfigPath `
+    -DestinationPath $WindowsConfigPath -TargetName "windows" `
+    -LaneStatePath $WindowsStatePath -LaneLogPath $WindowsLogPath
+Initialize-GuardianLaneState -SourcePath $StatePath `
+    -DestinationPath $DesktopStatePath `
+    -TargetName "windows-desktop-goal-state"
+Initialize-GuardianLaneState -SourcePath $StatePath `
+    -DestinationPath $WindowsStatePath -TargetName "windows"
 Set-DesktopAppServerEnvironment `
     -BackupPath $EnvironmentBackupPath -Url $SharedAppServerUrl
 
 if (-not $SkipTasks) {
     $PowerShellPath = (Get-Command "powershell.exe" -ErrorAction Stop).Source
     $LauncherPath = Join-Path $RuntimeRoot "scripts\guardian-launch.py"
-    $NativeArguments = "`"$LauncherPath`" watch --config `"$ConfigPath`" --interval $WatchIntervalSeconds --json"
+    $NativeArguments = "`"$LauncherPath`" watch --config `"$WindowsConfigPath`" --interval $WatchIntervalSeconds --json"
     $NativeAction = New-ScheduledTaskAction -Execute $PythonwPath `
         -Argument $NativeArguments -WorkingDirectory $RuntimeRoot
+    $DesktopArguments = "`"$LauncherPath`" watch --config `"$DesktopConfigPath`" --interval $WatchIntervalSeconds --json"
+    $DesktopAction = New-ScheduledTaskAction -Execute $PythonwPath `
+        -Argument $DesktopArguments -WorkingDirectory $RuntimeRoot
     $LogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $IntervalTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
         -RepetitionInterval (New-TimeSpan -Minutes 1)
@@ -701,6 +872,12 @@ if (-not $SkipTasks) {
         -Description "Host the shared loopback AppServer used by Codex Desktop and Goal Guardian." `
         -Force | Out-Null
     Write-Plan "registered $TaskAppServer"
+
+    Register-ScheduledTask -TaskName $TaskDesktop -Action $DesktopAction `
+        -Trigger @($LogonTrigger, $IntervalTrigger) -Settings $WatcherSettings `
+        -Description "Continuously supervise allowlisted Desktop Goals." `
+        -Force | Out-Null
+    Write-Plan "registered $TaskDesktop"
 
     Register-ScheduledTask -TaskName $TaskWindows -Action $NativeAction `
         -Trigger $LogonTrigger -Settings $WatcherSettings `
@@ -780,6 +957,7 @@ if (-not $SkipTasks) {
     if (-not $ListenerReady) {
         throw "Shared AppServer did not listen at $SharedAppServerUrl."
     }
+    Start-ScheduledTask -TaskName $TaskDesktop
     Start-ScheduledTask -TaskName $TaskWindows
     if (-not $SkipWslTask) {
         Start-ScheduledTask -TaskName $TaskWsl
@@ -790,3 +968,7 @@ if (-not $SkipTasks) {
 Write-Plan "installation complete"
 Remove-Item -LiteralPath $MaintenancePath -Force `
     -ErrorAction SilentlyContinue
+if ($null -ne $WslMaintenancePath) {
+    Remove-Item -LiteralPath $WslMaintenancePath -Force `
+        -ErrorAction SilentlyContinue
+}

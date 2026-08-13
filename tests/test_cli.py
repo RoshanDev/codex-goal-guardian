@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
 from codex_goal_guardian.cli import (
+    _maintenance_requested,
     _report_log_fingerprint,
     _report_worth_logging,
     build_parser,
@@ -152,6 +153,33 @@ class CliRoutingTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(output.getvalue())["status"],
                 "supervisor_already_active",
+            )
+
+    def test_run_once_skips_during_installer_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "state.json"
+            (root / "maintenance.lock").write_text("installer\n", encoding="utf-8")
+            config = SimpleNamespace(
+                log_path=str(root / "guardian.jsonl"),
+                state_path=str(state_path),
+            )
+            output = io.StringIO()
+            with (
+                patch("codex_goal_guardian.cli.load_config", return_value=config),
+                patch("codex_goal_guardian.cli.RecoveryEngine") as engine,
+                redirect_stdout(output),
+            ):
+                exit_code = main(
+                    ["run-once", "--config", "/tmp/config.json", "--json"]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(_maintenance_requested(config))
+            engine.assert_not_called()
+            self.assertEqual(
+                json.loads(output.getvalue())["status"],
+                "maintenance_active",
             )
 
     def test_desktop_request_is_queued_and_duplicate_is_coalesced(

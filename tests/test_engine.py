@@ -14,6 +14,8 @@ from codex_goal_guardian.config import (
 )
 from codex_goal_guardian.engine import (
     RecoveryEngine,
+    _has_in_progress_operation,
+    _latest_in_progress_turn_id,
     desktop_goal_reactivation_eligibility,
     looks_like_model_capacity_failure,
     looks_like_network_failure,
@@ -24,6 +26,7 @@ from codex_goal_guardian.health import HealthResult
 from codex_goal_guardian.state import (
     StateStore,
     default_state,
+    desktop_active_observation,
     desktop_direct_recovery_record,
     enqueue_desktop_recovery_request,
     is_recovery_pending,
@@ -561,7 +564,9 @@ class DesktopGoalReactivationEligibilityTests(unittest.TestCase):
 
         self.assertTrue(eligible, reason)
 
-    def test_any_in_progress_turn_blocks_desktop_reactivation(self) -> None:
+    def test_historical_in_progress_turn_does_not_block_latest_failure(
+        self,
+    ) -> None:
         thread = make_thread(source="vscode")
         thread["turns"].insert(
             0,
@@ -576,8 +581,29 @@ class DesktopGoalReactivationEligibilityTests(unittest.TestCase):
             already_recovered=False,
         )
 
-        self.assertFalse(eligible)
-        self.assertEqual(reason, "turn_in_progress")
+        self.assertTrue(eligible, reason)
+
+    def test_historical_in_progress_turn_is_not_a_stale_interrupt_target(
+        self,
+    ) -> None:
+        thread = make_thread(source="vscode")
+        thread["turns"].insert(
+            0,
+            {
+                "id": "historical-running-turn",
+                "status": "inProgress",
+                "items": [
+                    {
+                        "id": "historical-command",
+                        "type": "commandExecution",
+                        "status": "inProgress",
+                    }
+                ],
+            },
+        )
+
+        self.assertIsNone(_latest_in_progress_turn_id(thread))
+        self.assertFalse(_has_in_progress_operation(thread))
 
     def test_pending_recovery_ignores_only_empty_interrupted_artifact(
         self,
@@ -638,6 +664,7 @@ class _FakeClient:
         listed_thread: dict | None = None,
         goal: dict | None = None,
         reactivated_goal: dict | None = None,
+        fail_interrupt: bool = False,
     ) -> None:
         self.fail_start = fail_start
         self.read_sequence = list(read_sequence or [])
@@ -653,6 +680,7 @@ class _FakeClient:
             "updatedAt": 110,
         }
         self.reactivated_goal = reactivated_goal
+        self.fail_interrupt = fail_interrupt
         self.resume_calls = 0
         self.start_calls = 0
         self.start_models: list[str | None] = []
@@ -661,6 +689,7 @@ class _FakeClient:
         self.read_calls = 0
         self.list_calls = 0
         self.goal_calls = 0
+        self.interrupt_calls: list[tuple[str, str]] = []
 
     def __enter__(self) -> "_FakeClient":
         return self
@@ -695,6 +724,11 @@ class _FakeClient:
     def resume_thread(self, thread_id: str) -> dict:
         self.resume_calls += 1
         return make_thread()
+
+    def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        self.interrupt_calls.append((thread_id, turn_id))
+        if self.fail_interrupt:
+            raise AppServerError("turn/interrupt timed out after 30s")
 
     def start_turn(
         self,
@@ -1564,14 +1598,13 @@ class RecoveryEngineTests(unittest.TestCase):
         actions = report["targets"][0]["actions"]
         self.assertEqual(actions[0]["action"], "goal_state_reactivated")
         self.assertEqual(actions[1]["action"], "desktop_turn_started")
-        self.assertEqual(actions[2]["action"], "desktop_turn_settled")
         record = desktop_direct_recovery_record(
             self.store.load(),
             desktop_target.name,
             "thread-1",
         )
         self.assertEqual(record["turn_id"], "turn-1")
-        self.assertEqual(record["action"], "turn_settled")
+        self.assertEqual(record["action"], "turn_started")
         self.assertEqual(record["recovery_turn_id"], "turn-recovery")
 
     def test_desktop_policy_rejection_starts_one_fresh_continuation(self) -> None:
@@ -1628,7 +1661,6 @@ class RecoveryEngineTests(unittest.TestCase):
             [
                 "goal_state_reactivated",
                 "prompt_policy_continuation_started",
-                "prompt_policy_continuation_settled",
             ],
         )
 
@@ -1783,7 +1815,7 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual(client.start_calls, 1)
         self.assertEqual(
             [action["action"] for action in report["targets"][0]["actions"]],
-            ["desktop_turn_started", "desktop_turn_settled"],
+            ["desktop_turn_started"],
         )
 
     def test_shared_runtime_rearms_a_split_runtime_record(self) -> None:
@@ -1872,7 +1904,7 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual(client.start_calls, 1)
         self.assertEqual(
             [action["action"] for action in report["targets"][0]["actions"]],
-            ["desktop_turn_started", "desktop_turn_settled"],
+            ["desktop_turn_started"],
         )
         record = desktop_direct_recovery_record(
             self.store.load(),
@@ -1957,20 +1989,17 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual(client.start_calls, 0)
         self.assertEqual(
             [action["action"] for action in report["targets"][0]["actions"]],
-            [
-                "desktop_runtime_became_active",
-                "desktop_turn_settled",
-            ],
+            ["desktop_runtime_became_active"],
         )
         record = desktop_direct_recovery_record(
             self.store.load(),
             desktop_target.name,
             "thread-1",
         )
-        self.assertEqual(record["action"], "turn_settled")
+        self.assertEqual(record["action"], "runtime_active")
         self.assertEqual(record["recovery_turn_id"], "turn-auto")
 
-    def test_desktop_app_server_timeout_allows_large_task_resume(self) -> None:
+    def test_desktop_app_server_timeout_allows_large_thread_reads(self) -> None:
         desktop_target = TargetConfig(
             name="windows-desktop-goal-state",
             command=("codex",),
@@ -1981,6 +2010,236 @@ class RecoveryEngineTests(unittest.TestCase):
         client = RecoveryEngine._default_client(desktop_target)
 
         self.assertEqual(client.timeout_seconds, 120)
+
+    def test_stale_active_desktop_turn_is_interrupted_after_two_observations(
+        self,
+    ) -> None:
+        clock = {"now": 120}
+        target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=1_000,
+            desktop_thread_ids=("thread-1",),
+            desktop_stall_timeout_seconds=10,
+            desktop_operation_stall_timeout_seconds=30,
+        )
+        active = make_thread(
+            source="vscode",
+            thread_status="active",
+            turn_status="inProgress",
+            updated_at=110,
+        )
+        active["recencyAt"] = 110
+        goal = {
+            "threadId": "thread-1",
+            "objective": "finish safely",
+            "status": "active",
+            "tokenBudget": 40_000,
+            "tokensUsed": 100,
+            "timeUsedSeconds": 20,
+            "createdAt": 90,
+            "updatedAt": 110,
+        }
+        client = _FakeClient(listed_thread=active, goal=goal)
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            desktop_runtime_probe=lambda _: True,
+            now=lambda: clock["now"],
+            sleep=lambda _: None,
+        )
+
+        first = engine.run_once(config)
+        clock["now"] = 131
+        second = engine.run_once(config)
+
+        self.assertEqual(client.interrupt_calls, [("thread-1", "turn-1")])
+        self.assertEqual(
+            second["targets"][0]["actions"][0]["action"],
+            "desktop_stale_turn_interrupted",
+        )
+        self.assertEqual(
+            first["targets"][0]["skipped"][0]["reason"],
+            "desktop_active_progress_observed",
+        )
+        observation = desktop_active_observation(
+            self.store.load(),
+            target.name,
+            "thread-1",
+        )
+        assert observation is not None
+        self.assertEqual(observation["action"], "turn_interrupt_requested")
+        self.assertEqual(observation["last_interrupt_turn_id"], "turn-1")
+
+    def test_desktop_progress_resets_stall_window(self) -> None:
+        clock = {"now": 120}
+        target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=1_000,
+            desktop_thread_ids=("thread-1",),
+            desktop_stall_timeout_seconds=10,
+            desktop_operation_stall_timeout_seconds=30,
+        )
+        active = make_thread(
+            source="vscode",
+            thread_status="active",
+            turn_status="inProgress",
+            updated_at=110,
+        )
+        active["recencyAt"] = 110
+        client = _FakeClient(listed_thread=active)
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            desktop_runtime_probe=lambda _: True,
+            now=lambda: clock["now"],
+            sleep=lambda _: None,
+        )
+
+        engine.run_once(config)
+        active["recencyAt"] = 125
+        clock["now"] = 130
+        report = engine.run_once(config)
+
+        self.assertEqual(client.interrupt_calls, [])
+        self.assertEqual(
+            report["targets"][0]["skipped"][0]["reason"],
+            "desktop_active_progress_observed",
+        )
+
+    def test_active_operation_uses_harder_stall_timeout(self) -> None:
+        clock = {"now": 120}
+        target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=1_000,
+            desktop_thread_ids=("thread-1",),
+            desktop_stall_timeout_seconds=10,
+            desktop_operation_stall_timeout_seconds=30,
+        )
+        active = make_thread(
+            source="vscode",
+            thread_status="active",
+            turn_status="inProgress",
+            updated_at=110,
+        )
+        active["turns"][0]["items"] = [
+            {
+                "id": "command-1",
+                "type": "commandExecution",
+                "status": "inProgress",
+            }
+        ]
+        client = _FakeClient(listed_thread=active)
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            desktop_runtime_probe=lambda _: True,
+            now=lambda: clock["now"],
+            sleep=lambda _: None,
+        )
+
+        engine.run_once(config)
+        clock["now"] = 125
+        within_hard_window = engine.run_once(config)
+        clock["now"] = 151
+        after_hard_window = engine.run_once(config)
+
+        self.assertEqual(client.interrupt_calls, [("thread-1", "turn-1")])
+        self.assertEqual(
+            within_hard_window["targets"][0]["skipped"][0][
+                "stall_timeout_seconds"
+            ],
+            30,
+        )
+        self.assertEqual(
+            after_hard_window["targets"][0]["actions"][0]["action"],
+            "desktop_stale_turn_interrupted",
+        )
+
+    def test_missing_stale_turn_id_requests_windows_app_server_restart(
+        self,
+    ) -> None:
+        clock = {"now": 120}
+        target = TargetConfig(
+            name="windows-desktop-goal-state",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            app_server_url="ws://127.0.0.1:47831/rpc",
+            recovery_mode="desktop_goal_state",
+            allowed_sources=("vscode",),
+            max_thread_age_seconds=1_000,
+            desktop_thread_ids=("thread-1",),
+            desktop_stall_timeout_seconds=10,
+            desktop_operation_stall_timeout_seconds=30,
+        )
+        active = make_thread(
+            source="vscode",
+            thread_status="active",
+            turn_status="completed",
+            updated_at=110,
+        )
+        client = _FakeClient(listed_thread=active)
+        config = GuardianConfig(
+            state_path=str(self.store.path),
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            desktop_runtime_probe=lambda _: True,
+            now=lambda: clock["now"],
+            sleep=lambda _: None,
+        )
+
+        engine.run_once(config)
+        clock["now"] = 131
+        report = engine.run_once(config)
+
+        marker = self.store.path.with_name("app-server-restart.request")
+        self.assertTrue(marker.is_file())
+        self.assertEqual(
+            json.loads(marker.read_text(encoding="utf-8"))["reason"],
+            "stale_active_turn_id_missing",
+        )
+        self.assertEqual(
+            report["targets"][0]["actions"][0]["action"],
+            "desktop_app_server_restart_requested",
+        )
 
     def test_delegated_cli_timeout_allows_large_task_resume(self) -> None:
         target = TargetConfig(

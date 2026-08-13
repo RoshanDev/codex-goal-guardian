@@ -107,13 +107,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if report["ok"] else 2
         if arguments.command_name == "run-once":
             config = load_config(arguments.config)
-            with singleton_supervisor(config.state_path) as acquired:
-                if not acquired:
-                    report = _supervisor_active_report()
-                else:
-                    report = RecoveryEngine().run_once(
-                        config, dry_run=arguments.dry_run
-                    )
+            if _maintenance_requested(config):
+                report = _maintenance_active_report()
+            else:
+                with singleton_supervisor(config.state_path) as acquired:
+                    if not acquired:
+                        report = _supervisor_active_report()
+                    else:
+                        report = RecoveryEngine().run_once(
+                            config, dry_run=arguments.dry_run
+                        )
             if _report_worth_logging(report):
                 append_json_log(
                     config.log_path, {"kind": "run_once", "report": report}
@@ -469,6 +472,9 @@ def _watch(arguments: argparse.Namespace) -> int:
         last_log_fingerprint: str | None = None
         last_logged_at = 0.0
         while True:
+            if _maintenance_requested(config):
+                time.sleep(arguments.interval)
+                continue
             report = engine.run_once(config, dry_run=arguments.dry_run)
             if _report_worth_logging(report):
                 fingerprint = _report_log_fingerprint(report)
@@ -493,6 +499,18 @@ def _supervisor_active_report() -> dict[str, Any]:
     return {
         "ok": True,
         "status": "supervisor_already_active",
+        "targets": [],
+    }
+
+
+def _maintenance_requested(config: GuardianConfig) -> bool:
+    return (Path(config.state_path).expanduser().parent / "maintenance.lock").is_file()
+
+
+def _maintenance_active_report() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "maintenance_active",
         "targets": [],
     }
 

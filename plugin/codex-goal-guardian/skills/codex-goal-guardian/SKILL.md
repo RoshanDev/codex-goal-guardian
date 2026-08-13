@@ -20,18 +20,26 @@ attempts, whether Guardian is installed, or how to inspect its recovery state.
   Goal to `active`. With explicit `delegated_continuity_enabled`, treat the
   thread allowlist as frozen-scope delegation and continue idle blocked or
   usage-limited Goals after completed, failed, or interrupted turns. Never
-  wake a complete, paused, budget-limited, or `inProgress` Goal. Network
+  wake a complete, paused, or budget-limited Goal. Leave progressing
+  `inProgress` Goals alone; active-turn convergence requires a persisted
+  unchanged liveness window and a fresh matching pre-interrupt read before
+  `turn/interrupt` targets the actual latest active turn. Network
   evidence may come from App Server state or the read-only session JSONL.
 - Treat an explicit allowlist entry as opt-in authority to wake that task. After
   Goal reactivation, read thread and Goal repeatedly, call `thread/resume`, and
-  call one deterministic `turn/start` only if the task remains idle. Stay
-  attached until the continuation settles.
+  call one deterministic `turn/start` only if the task remains idle. Record a
+  started Desktop continuation and return to the nonblocking supervision loop.
 - Deduplicate direct Desktop recovery by failed turn ID and deterministic
   client message ID.
 - For delegated continuity, make in-scope decisions without intermediate user
   approval, while never inventing new scope or replaying completed/uncertain
   exact-once external actions.
 - Treat the external Guardian as the native Windows/WSL CLI recovery authority.
+- Keep Desktop and native Windows CLI supervision in isolated scheduler/state
+  lanes so a long stdio CLI recovery cannot starve Desktop liveness checks.
+- If a confirmed-stale Desktop interrupt RPC times out, request restart only
+  of the Guardian-owned shared App Server through the independent watchdog.
+  Never restart the Desktop app or an unrelated process.
 - Require one nonblocking supervisor lease per state file. A duplicate watcher
   or timer must exit successfully as `supervisor_already_active`, never wait on
   the active supervisor's state lock.
@@ -116,6 +124,9 @@ legacy fallback.
    If the app cannot reach that listener and fails before showing its main
    window, use the backed-up environment value as the fail-open recovery path;
    never guess or delete unrelated user environment variables.
+   Inspect `state-desktop.json` for `desktop_active_observations`; progress must
+   change the fingerprint/recency across passes, while a stale interrupt must
+   name the actual latest active turn ID.
 2. For CLI, run `doctor` for the affected native runtime.
 3. Confirm the resolved WSL executable is a Linux path and not a Windows shim.
 4. Inspect `status` for health, outage generation, and `recovery_pending`.

@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -12,6 +13,8 @@ from .config import TargetConfig
 
 
 CREATE_NO_WINDOW = 0x08000000
+_WINDOWS_PROCESS_CACHE: tuple[float, list[dict[str, object]]] | None = None
+_WINDOWS_PROCESS_CACHE_SECONDS = 5.0
 
 
 def cli_process_is_running(target: TargetConfig) -> bool:
@@ -112,29 +115,41 @@ def _windows_cli_process_is_running(command: Sequence[str]) -> bool:
 
 
 def _windows_process_records() -> list[dict[str, object]]:
+    global _WINDOWS_PROCESS_CACHE
+    now = time.monotonic()
+    if (
+        _WINDOWS_PROCESS_CACHE is not None
+        and now - _WINDOWS_PROCESS_CACHE[0] <= _WINDOWS_PROCESS_CACHE_SECONDS
+    ):
+        return [dict(record) for record in _WINDOWS_PROCESS_CACHE[1]]
     powershell = shutil.which("powershell.exe") or shutil.which("powershell")
     if powershell is None:
         raise RuntimeError("powershell is required for process ownership probe")
-    completed = subprocess.run(
-        (
-            powershell,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
+    try:
+        completed = subprocess.run(
             (
-                "Get-CimInstance Win32_Process | "
-                "Select-Object ProcessId,ExecutablePath,CommandLine | "
-                "ConvertTo-Json -Compress"
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "Get-CimInstance Win32_Process | "
+                    "Select-Object ProcessId,ExecutablePath,CommandLine | "
+                    "ConvertTo-Json -Compress"
+                ),
             ),
-        ),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
-        check=False,
-        creationflags=CREATE_NO_WINDOW,
-    )
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        if _WINDOWS_PROCESS_CACHE is not None:
+            return [dict(record) for record in _WINDOWS_PROCESS_CACHE[1]]
+        raise
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
         raise RuntimeError(
@@ -147,7 +162,9 @@ def _windows_process_records() -> list[dict[str, object]]:
             "Windows process ownership probe returned invalid JSON"
         ) from error
     records = payload if isinstance(payload, list) else [payload]
-    return [record for record in records if isinstance(record, dict)]
+    normalized = [record for record in records if isinstance(record, dict)]
+    _WINDOWS_PROCESS_CACHE = (now, normalized)
+    return [dict(record) for record in normalized]
 
 
 def _arguments_match_command(

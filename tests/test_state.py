@@ -8,6 +8,7 @@ from codex_goal_guardian.state import (
     StateStore,
     default_state,
     delegated_cli_recovery_record,
+    desktop_active_observation,
     enqueue_desktop_recovery_request,
     finish_desktop_recovery_request,
     mark_recovered,
@@ -15,6 +16,7 @@ from codex_goal_guardian.state import (
     pending_desktop_recovery_requests,
     save_model_capacity_recovery,
     save_delegated_cli_recovery,
+    save_desktop_active_observation,
     transition_health,
     was_recovered,
 )
@@ -223,6 +225,31 @@ class HealthTransitionTests(unittest.TestCase):
         )
         self.assertGreater(next_request["generation"], first["generation"])
         self.assertFalse(next_request["coalesced"])
+
+    def test_desktop_active_observation_is_persisted_per_thread(self) -> None:
+        state = default_state()
+
+        save_desktop_active_observation(
+            state,
+            "desktop",
+            "thread-a",
+            {
+                "fingerprint": "abc",
+                "last_progress_at": 190,
+                "unchanged_observations": 2,
+            },
+            now=200,
+        )
+
+        self.assertEqual(
+            desktop_active_observation(state, "desktop", "thread-a"),
+            {
+                "fingerprint": "abc",
+                "last_progress_at": 190,
+                "unchanged_observations": 2,
+                "recorded_at": 200,
+            },
+        )
 
     def test_desktop_recovery_finish_requires_matching_generation(self) -> None:
         state = default_state()

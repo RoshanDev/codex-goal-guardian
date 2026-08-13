@@ -110,6 +110,8 @@ class ConfigTests(unittest.TestCase):
                     "desktop_thread_ids": [" thread-1 "],
                     "prompt_policy_retry_enabled": True,
                     "delegated_continuity_enabled": True,
+                    "desktop_stall_timeout_seconds": 300,
+                    "desktop_operation_stall_timeout_seconds": 1800,
                 }
             ],
         }
@@ -131,6 +133,41 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.targets[0].desktop_thread_ids, ("thread-1",))
         self.assertTrue(config.targets[0].prompt_policy_retry_enabled)
         self.assertTrue(config.targets[0].delegated_continuity_enabled)
+        self.assertEqual(
+            config.targets[0].desktop_stall_timeout_seconds,
+            300,
+        )
+        self.assertEqual(
+            config.targets[0].desktop_operation_stall_timeout_seconds,
+            1800,
+        )
+
+    def test_rejects_desktop_operation_timeout_below_soft_timeout(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "state_path": "state.json",
+            "log_path": "guardian.jsonl",
+            "targets": [
+                {
+                    "name": "windows-desktop-goal-state",
+                    "command": ["codex.cmd"],
+                    "codex_home": "codex-home",
+                    "app_server_url": "ws://127.0.0.1:47831/rpc",
+                    "recovery_mode": "desktop_goal_state",
+                    "desktop_stall_timeout_seconds": 300,
+                    "desktop_operation_stall_timeout_seconds": 60,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "desktop_operation_stall_timeout_seconds",
+            ):
+                load_config(path)
 
     def test_rejects_duplicate_desktop_thread_ids(self) -> None:
         payload = {

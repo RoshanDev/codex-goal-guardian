@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import mmap
 import os
@@ -18,6 +19,8 @@ from .ownership import (
 )
 from .state import (
     StateStore,
+    clear_desktop_active_observation,
+    desktop_active_observation,
     desktop_direct_recovery_record,
     delegated_cli_recovery_record,
     finish_desktop_recovery_request,
@@ -28,6 +31,7 @@ from .state import (
     pending_desktop_recovery_requests,
     recovery_record,
     recovery_records,
+    save_desktop_active_observation,
     save_model_capacity_recovery,
     save_delegated_cli_recovery,
     set_recovery_pending,
@@ -1063,6 +1067,9 @@ class RecoveryEngine:
                         }
                     )
 
+                    if target.recovery_mode == "desktop_goal_state":
+                        return "acted"
+
                     settled_thread, settled_goal = self._wait_until_settled(
                         client, thread_id, target
                     )
@@ -1221,7 +1228,7 @@ class RecoveryEngine:
                     )
                     try:
                         thread = client.read_thread(
-                            thread_id, include_turns=True
+                            thread_id, include_turns=not direct
                         )
                         goal = client.get_goal(thread_id)
 
@@ -1244,11 +1251,35 @@ class RecoveryEngine:
                                     }
                                 )
                                 continue
+                            if direct and _thread_status(thread) == "active":
+                                self._supervise_active_desktop_turn(
+                                    client,
+                                    target,
+                                    thread_id,
+                                    thread,
+                                    goal,
+                                    state,
+                                    store,
+                                    report,
+                                    now,
+                                    dry_run=dry_run,
+                                )
+                            elif direct and clear_desktop_active_observation(
+                                state,
+                                target.name,
+                                thread_id,
+                            ):
+                                store.save(state)
                             if (
                                 direct
                                 and target.start_recovery_turn
                                 and not _thread_or_turn_active(thread)
                             ):
+                                if not isinstance(thread.get("turns"), list):
+                                    thread = client.read_thread(
+                                        thread_id,
+                                        include_turns=True,
+                                    )
                                 evidence_turn_id = (
                                     _desktop_continuity_turn_id(
                                         thread,
@@ -1329,6 +1360,36 @@ class RecoveryEngine:
                                     }
                                 )
                             continue
+
+                        if direct and clear_desktop_active_observation(
+                            state,
+                            target.name,
+                            thread_id,
+                        ):
+                            store.save(state)
+                        if direct and not isinstance(
+                            thread.get("turns"), list
+                        ):
+                            goal_status = (
+                                str(goal.get("status", "missing"))
+                                if isinstance(goal, dict)
+                                else "missing"
+                            )
+                            recoverable_statuses = {"blocked"}
+                            if target.delegated_continuity_enabled:
+                                recoverable_statuses.add("usageLimited")
+                            if goal_status not in recoverable_statuses:
+                                report["skipped"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "reason": f"goal_{goal_status}",
+                                    }
+                                )
+                                continue
+                            thread = client.read_thread(
+                                thread_id,
+                                include_turns=True,
+                            )
 
                         eligible, reason = (
                             desktop_goal_reactivation_eligibility(
@@ -1672,6 +1733,23 @@ class RecoveryEngine:
                                 )
                     except Exception as error:
                         had_error = True
+                        if _app_server_transport_failure(error):
+                            requested_restart = _request_app_server_restart(
+                                store,
+                                target,
+                                thread_id=thread_id,
+                                reason="desktop_rpc_failure",
+                                now=now,
+                            )
+                            if requested_restart:
+                                report["actions"].append(
+                                    {
+                                        "thread_id": thread_id,
+                                        "action": (
+                                            "desktop_app_server_restart_requested"
+                                        ),
+                                    }
+                                )
                         report["errors"].append(
                             {
                                 "thread_id": thread_id,
@@ -1679,11 +1757,343 @@ class RecoveryEngine:
                             }
                         )
         except Exception as error:
+            if _app_server_transport_failure(error):
+                requested_restart = _request_app_server_restart(
+                    store,
+                    target,
+                    thread_id=None,
+                    reason="desktop_connection_failure",
+                    now=now,
+                )
+                if requested_restart:
+                    report["actions"].append(
+                        {
+                            "thread_id": None,
+                            "action": "desktop_app_server_restart_requested",
+                        }
+                    )
             report["errors"].append(
                 {"thread_id": None, "error": _safe_exception(error)}
             )
             return False
         return not had_error and not recovery_waiting
+
+    def _supervise_active_desktop_turn(
+        self,
+        client: Any,
+        target: TargetConfig,
+        thread_id: str,
+        thread: dict[str, Any],
+        goal: dict[str, Any],
+        state: dict[str, Any],
+        store: StateStore,
+        report: dict[str, Any],
+        now: int,
+        *,
+        dry_run: bool,
+    ) -> None:
+        timeout = target.desktop_stall_timeout_seconds
+        if timeout <= 0:
+            report["skipped"].append(
+                {"thread_id": thread_id, "reason": "thread_active"}
+            )
+            return
+
+        fingerprint = _desktop_activity_fingerprint(thread, goal)
+        active_turn_id = _latest_in_progress_turn_id(thread)
+        operation_in_progress = _has_in_progress_operation(thread)
+        previous = desktop_active_observation(
+            state,
+            target.name,
+            thread_id,
+        )
+        if (
+            not isinstance(previous, dict)
+            or previous.get("fingerprint") != fingerprint
+        ):
+            record = {
+                "fingerprint": fingerprint,
+                "active_turn_id": active_turn_id,
+                "operation_in_progress": operation_in_progress,
+                "first_observed_at": now,
+                "last_progress_at": now,
+                "unchanged_observations": 1,
+                "action": "progress_observed",
+                "last_interrupt_turn_id": None,
+                "last_interrupt_at": None,
+            }
+            if not dry_run:
+                save_desktop_active_observation(
+                    state,
+                    target.name,
+                    thread_id,
+                    record,
+                    now=now,
+                )
+                store.save(state)
+            report["skipped"].append(
+                {
+                    "thread_id": thread_id,
+                    "reason": "desktop_active_progress_observed",
+                    "turn_id": active_turn_id,
+                }
+            )
+            return
+
+        record = dict(previous)
+        record.update(
+            {
+                "active_turn_id": active_turn_id,
+                "operation_in_progress": operation_in_progress,
+                "unchanged_observations": int(
+                    previous.get("unchanged_observations", 0)
+                )
+                + 1,
+                "action": "observing",
+            }
+        )
+        last_progress_at = int(previous.get("last_progress_at", now))
+        effective_timeout = (
+            target.desktop_operation_stall_timeout_seconds
+            if operation_in_progress
+            else timeout
+        )
+        stalled_for = max(0, now - last_progress_at)
+        observations = int(record["unchanged_observations"])
+
+        if not dry_run:
+            save_desktop_active_observation(
+                state,
+                target.name,
+                thread_id,
+                record,
+                now=now,
+            )
+            store.save(state)
+
+        if stalled_for < effective_timeout or observations < 2:
+            report["skipped"].append(
+                {
+                    "thread_id": thread_id,
+                    "reason": "desktop_active_within_stall_window",
+                    "turn_id": active_turn_id,
+                    "stalled_for_seconds": stalled_for,
+                    "stall_timeout_seconds": effective_timeout,
+                }
+            )
+            return
+
+        last_interrupt_at = _optional_record_int(
+            previous.get("last_interrupt_at")
+        )
+        if (
+            last_interrupt_at is not None
+            and now - last_interrupt_at < max(60, timeout)
+        ):
+            report["skipped"].append(
+                {
+                    "thread_id": thread_id,
+                    "reason": "desktop_stale_interrupt_settling",
+                    "turn_id": previous.get("last_interrupt_turn_id"),
+                }
+            )
+            return
+
+        if dry_run:
+            report["actions"].append(
+                {
+                    "thread_id": thread_id,
+                    "action": "would_interrupt_stale_desktop_turn",
+                    "turn_id": active_turn_id,
+                    "stalled_for_seconds": stalled_for,
+                }
+            )
+            return
+
+        fresh_thread = client.read_thread(thread_id, include_turns=True)
+        fresh_goal = client.get_goal(thread_id)
+        if (
+            not isinstance(fresh_goal, dict)
+            or fresh_goal.get("status") != "active"
+            or _thread_status(fresh_thread) != "active"
+        ):
+            clear_desktop_active_observation(
+                state,
+                target.name,
+                thread_id,
+            )
+            store.save(state)
+            report["skipped"].append(
+                {
+                    "thread_id": thread_id,
+                    "reason": "desktop_activity_changed_before_interrupt",
+                }
+            )
+            return
+
+        fresh_fingerprint = _desktop_activity_fingerprint(
+            fresh_thread,
+            fresh_goal,
+        )
+        if fresh_fingerprint != fingerprint:
+            save_desktop_active_observation(
+                state,
+                target.name,
+                thread_id,
+                {
+                    "fingerprint": fresh_fingerprint,
+                    "active_turn_id": _latest_in_progress_turn_id(
+                        fresh_thread
+                    ),
+                    "operation_in_progress": (
+                        _has_in_progress_operation(fresh_thread)
+                    ),
+                    "first_observed_at": now,
+                    "last_progress_at": now,
+                    "unchanged_observations": 1,
+                    "action": "progress_observed_pre_interrupt",
+                    "last_interrupt_turn_id": None,
+                    "last_interrupt_at": None,
+                },
+                now=now,
+            )
+            store.save(state)
+            report["skipped"].append(
+                {
+                    "thread_id": thread_id,
+                    "reason": "desktop_activity_changed_before_interrupt",
+                }
+            )
+            return
+
+        fresh_turn_id = _latest_in_progress_turn_id(fresh_thread)
+        fresh_operation_in_progress = _has_in_progress_operation(
+            fresh_thread
+        )
+        if (
+            fresh_operation_in_progress
+            and stalled_for
+            < target.desktop_operation_stall_timeout_seconds
+        ):
+            record.update(
+                {
+                    "operation_in_progress": True,
+                    "action": "operation_still_in_progress",
+                }
+            )
+            save_desktop_active_observation(
+                state,
+                target.name,
+                thread_id,
+                record,
+                now=now,
+            )
+            store.save(state)
+            report["skipped"].append(
+                {
+                    "thread_id": thread_id,
+                    "reason": "desktop_operation_within_stall_window",
+                    "turn_id": fresh_turn_id,
+                    "stalled_for_seconds": stalled_for,
+                    "stall_timeout_seconds": (
+                        target.desktop_operation_stall_timeout_seconds
+                    ),
+                }
+            )
+            return
+        if fresh_turn_id is None:
+            requested_restart = _request_app_server_restart(
+                store,
+                target,
+                thread_id=thread_id,
+                reason="stale_active_turn_id_missing",
+                now=now,
+            )
+            record.update(
+                {
+                    "action": "app_server_restart_requested",
+                    "restart_requested_at": now,
+                }
+            )
+            save_desktop_active_observation(
+                state,
+                target.name,
+                thread_id,
+                record,
+                now=now,
+            )
+            store.save(state)
+            report["actions"].append(
+                {
+                    "thread_id": thread_id,
+                    "action": (
+                        "desktop_app_server_restart_requested"
+                        if requested_restart
+                        else "desktop_app_server_restart_pending"
+                    ),
+                    "reason": "stale_active_turn_id_missing",
+                }
+            )
+            return
+
+
+        try:
+            client.interrupt_turn(thread_id, fresh_turn_id)
+        except Exception:
+            requested_restart = _request_app_server_restart(
+                store,
+                target,
+                thread_id=thread_id,
+                reason="stale_turn_interrupt_failed",
+                now=now,
+            )
+            record.update(
+                {
+                    "action": "interrupt_failed_restart_requested",
+                    "restart_requested_at": now,
+                }
+            )
+            save_desktop_active_observation(
+                state,
+                target.name,
+                thread_id,
+                record,
+                now=now,
+            )
+            store.save(state)
+            if requested_restart:
+                report["actions"].append(
+                    {
+                        "thread_id": thread_id,
+                        "action": "desktop_app_server_restart_requested",
+                        "reason": "stale_turn_interrupt_failed",
+                    }
+                )
+            raise
+
+        record.update(
+            {
+                "action": "turn_interrupt_requested",
+                "last_interrupt_turn_id": fresh_turn_id,
+                "last_interrupt_at": now,
+            }
+        )
+        save_desktop_active_observation(
+            state,
+            target.name,
+            thread_id,
+            record,
+            now=now,
+        )
+        store.save(state)
+        report["actions"].append(
+            {
+                "thread_id": thread_id,
+                "action": "desktop_stale_turn_interrupted",
+                "turn_id": fresh_turn_id,
+                "stalled_for_seconds": stalled_for,
+            }
+        )
 
     def _start_prompt_policy_continuation(
         self,
@@ -1743,35 +2153,6 @@ class RecoveryEngine:
                 "action": "prompt_policy_continuation_started",
                 "turn_id": normalized_turn_id,
                 "client_user_message_id": message_id,
-                "mode": "direct",
-            }
-        )
-        _, goal_after_turn = self._wait_until_settled(
-            client,
-            thread_id,
-            target,
-        )
-        mark_desktop_direct_recovery(
-            state,
-            target.name,
-            thread_id,
-            turn_id=evidence_turn_id,
-            action="prompt_policy_turn_settled",
-            recovery_turn_id=normalized_turn_id,
-            app_server_url=target.app_server_url,
-            now=now,
-        )
-        store.save(state)
-        report["actions"].append(
-            {
-                "thread_id": thread_id,
-                "action": "prompt_policy_continuation_settled",
-                "turn_id": normalized_turn_id,
-                "goal_status": (
-                    goal_after_turn.get("status")
-                    if isinstance(goal_after_turn, dict)
-                    else None
-                ),
                 "mode": "direct",
             }
         )
@@ -1904,35 +2285,6 @@ class RecoveryEngine:
                         "mode": "direct",
                     }
                 )
-                _, goal_after_turn = self._wait_until_settled(
-                    client,
-                    thread_id,
-                    target,
-                )
-                mark_desktop_direct_recovery(
-                    state,
-                    target.name,
-                    thread_id,
-                    turn_id=evidence_turn_id,
-                    action="turn_settled",
-                    recovery_turn_id=recovery_turn_id,
-                    app_server_url=target.app_server_url,
-                    now=now,
-                )
-                store.save(state)
-                report["actions"].append(
-                    {
-                        "thread_id": thread_id,
-                        "action": "desktop_turn_settled",
-                        "turn_id": recovery_turn_id,
-                        "goal_status": (
-                            goal_after_turn.get("status")
-                            if isinstance(goal_after_turn, dict)
-                            else None
-                        ),
-                        "mode": "direct",
-                    }
-                )
                 return
 
         message_id = _desktop_recovery_message_id(
@@ -1968,36 +2320,6 @@ class RecoveryEngine:
                 "action": "desktop_turn_started",
                 "turn_id": recovery_turn_id,
                 "client_user_message_id": message_id,
-                "mode": "direct",
-            }
-        )
-
-        _, goal_after_turn = self._wait_until_settled(
-            client,
-            thread_id,
-            target,
-        )
-        mark_desktop_direct_recovery(
-            state,
-            target.name,
-            thread_id,
-            turn_id=evidence_turn_id,
-            action="turn_settled",
-            recovery_turn_id=normalized_recovery_turn_id,
-            app_server_url=target.app_server_url,
-            now=now,
-        )
-        store.save(state)
-        report["actions"].append(
-            {
-                "thread_id": thread_id,
-                "action": "desktop_turn_settled",
-                "turn_id": recovery_turn_id,
-                "goal_status": (
-                    goal_after_turn.get("status")
-                    if isinstance(goal_after_turn, dict)
-                    else None
-                ),
                 "mode": "direct",
             }
         )
@@ -2811,14 +3133,60 @@ def _desktop_continuity_turn_id(
 
 
 def _has_in_progress_turn(thread: dict[str, Any]) -> bool:
-    turns = thread.get("turns")
+    candidate = _latest_recovery_candidate_turn(thread)
     return bool(
-        isinstance(turns, list)
-        and any(
-            isinstance(turn, dict) and turn.get("status") == "inProgress"
-            for turn in turns
-        )
+        isinstance(candidate, dict)
+        and candidate.get("status") == "inProgress"
     )
+
+
+def _latest_in_progress_turn_id(thread: dict[str, Any]) -> str | None:
+    candidate = _latest_recovery_candidate_turn(thread)
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("status") != "inProgress"
+    ):
+        return None
+    value = candidate.get("id")
+    return value if isinstance(value, str) and value and len(value) <= 128 else None
+
+
+def _has_in_progress_operation(thread: dict[str, Any]) -> bool:
+    candidate = _latest_recovery_candidate_turn(thread)
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("status") != "inProgress"
+    ):
+        return False
+    items = candidate.get("items")
+    if not isinstance(items, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("status", "")).lower()
+        in {"inprogress", "running"}
+        for item in items
+    )
+
+
+def _desktop_activity_fingerprint(
+    thread: dict[str, Any], goal: dict[str, Any]
+) -> str:
+    snapshot = {
+        "thread_status": _thread_status(thread),
+        "thread_recency_at": thread.get("recencyAt"),
+        "thread_updated_at": thread.get("updatedAt"),
+        "goal_updated_at": goal.get("updatedAt"),
+        "goal_tokens_used": goal.get("tokensUsed"),
+    }
+    encoded = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _latest_turn_id(thread: dict[str, Any]) -> str | None:
@@ -2838,6 +3206,7 @@ def _latest_activity_timestamp(
     thread: dict[str, Any], goal: Optional[dict[str, Any]]
 ) -> int | None:
     timestamps = [
+        _timestamp_seconds(thread.get("recencyAt")),
         _timestamp_seconds(thread.get("updatedAt")),
         _timestamp_seconds(goal.get("updatedAt"))
         if isinstance(goal, dict)
@@ -2906,9 +3275,62 @@ def _has_staged_recovery(
 
 
 def _thread_or_turn_active(thread: dict[str, Any]) -> bool:
-    if _thread_status(thread) == "active":
-        return True
+    status = _thread_status(thread)
+    if status:
+        return status == "active"
     return _has_in_progress_turn(thread)
+
+
+def _optional_record_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _app_server_transport_failure(error: BaseException) -> bool:
+    if not isinstance(error, AppServerError):
+        return False
+    message = str(error).lower()
+    return any(marker in message for marker in _NETWORK_ERROR_MARKERS)
+
+
+def _request_app_server_restart(
+    store: StateStore,
+    target: TargetConfig,
+    *,
+    thread_id: str | None,
+    reason: str,
+    now: int,
+) -> bool:
+    if target.app_server_url is None:
+        return False
+    destination = store.path.with_name("app-server-restart.request")
+    if destination.exists():
+        return False
+    payload = {
+        "schema_version": 1,
+        "requested_at": now,
+        "target": target.name,
+        "thread_id": thread_id,
+        "reason": reason,
+    }
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return True
 
 
 def _timestamp_seconds(value: Any) -> int | None:

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from codex_goal_guardian.config import TargetConfig
+from codex_goal_guardian import ownership
 from codex_goal_guardian.ownership import (
     _arguments_match_command,
     _command_line_matches,
@@ -22,6 +23,68 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OwnershipProbeTests(unittest.TestCase):
+    def test_windows_process_probe_is_cached_within_one_pass(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=("powershell.exe",),
+            returncode=0,
+            stdout='[{"ProcessId":1,"CommandLine":"codex"}]',
+            stderr="",
+        )
+        with (
+            mock.patch.object(ownership, "_WINDOWS_PROCESS_CACHE", None),
+            mock.patch.object(
+                ownership.shutil,
+                "which",
+                return_value="powershell.exe",
+            ),
+            mock.patch.object(
+                ownership.subprocess,
+                "run",
+                return_value=completed,
+            ) as run,
+            mock.patch.object(
+                ownership.time,
+                "monotonic",
+                side_effect=(10.0, 12.0),
+            ),
+        ):
+            first = ownership._windows_process_records()
+            second = ownership._windows_process_records()
+
+        self.assertEqual(first, second)
+        self.assertEqual(run.call_count, 1)
+
+    def test_windows_process_probe_uses_last_cache_on_timeout(self) -> None:
+        cached = [{"ProcessId": 7, "CommandLine": "codex"}]
+        with (
+            mock.patch.object(
+                ownership,
+                "_WINDOWS_PROCESS_CACHE",
+                (1.0, cached),
+            ),
+            mock.patch.object(
+                ownership.shutil,
+                "which",
+                return_value="powershell.exe",
+            ),
+            mock.patch.object(
+                ownership.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(
+                    cmd=("powershell.exe",),
+                    timeout=15,
+                ),
+            ),
+            mock.patch.object(
+                ownership.time,
+                "monotonic",
+                return_value=10.0,
+            ),
+        ):
+            records = ownership._windows_process_records()
+
+        self.assertEqual(records, cached)
+
     def test_app_server_process_is_not_treated_as_cli_owner(self) -> None:
         self.assertTrue(
             _is_app_server_arguments(

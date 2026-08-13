@@ -36,6 +36,8 @@ class TargetConfig:
     desktop_thread_ids: tuple[str, ...] = ()
     prompt_policy_retry_enabled: bool = False
     delegated_continuity_enabled: bool = False
+    desktop_stall_timeout_seconds: int = 0
+    desktop_operation_stall_timeout_seconds: int = 1_800
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,27 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
             "model_capacity_backoff_max_seconds must be greater than or "
             "equal to model_capacity_backoff_initial_seconds"
         )
+    desktop_stall_timeout_seconds = int(
+        data.get("desktop_stall_timeout_seconds", 0)
+    )
+    desktop_operation_stall_timeout_seconds = int(
+        data.get("desktop_operation_stall_timeout_seconds", 1_800)
+    )
+    if desktop_stall_timeout_seconds < 0:
+        raise ValueError("desktop_stall_timeout_seconds must not be negative")
+    if desktop_operation_stall_timeout_seconds < 1:
+        raise ValueError(
+            "desktop_operation_stall_timeout_seconds must be at least 1"
+        )
+    if (
+        desktop_stall_timeout_seconds > 0
+        and desktop_operation_stall_timeout_seconds
+        < desktop_stall_timeout_seconds
+    ):
+        raise ValueError(
+            "desktop_operation_stall_timeout_seconds must be greater than "
+            "or equal to desktop_stall_timeout_seconds"
+        )
     return TargetConfig(
         name=str(data["name"]),
         command=tuple(command),
@@ -177,6 +200,10 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
         ),
         delegated_continuity_enabled=bool(
             data.get("delegated_continuity_enabled", False)
+        ),
+        desktop_stall_timeout_seconds=desktop_stall_timeout_seconds,
+        desktop_operation_stall_timeout_seconds=(
+            desktop_operation_stall_timeout_seconds
         ),
     )
 

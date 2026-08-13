@@ -10,9 +10,13 @@ class InstallerInvariantTests(unittest.TestCase):
         content = (ROOT / "installers/windows/install.ps1").read_text(
             encoding="utf-8"
         )
+        watchdog = (ROOT / "scripts/watchdog-windows.ps1").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("$env:LOCALAPPDATA", content)
         self.assertIn("CodexGoalGuardian-Windows", content)
+        self.assertIn("CodexGoalGuardian-Desktop", content)
         self.assertIn("CodexGoalGuardian-WSL", content)
         self.assertIn("CodexGoalGuardian-Watchdog", content)
         self.assertIn("CodexGoalGuardian-AppServer", content)
@@ -25,6 +29,13 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("[int]$DrainTimeoutMinutes", content)
         self.assertIn("Wait-GuardianRecoveryDrain", content)
         self.assertIn('"maintenance.lock"', content)
+        self.assertIn("$WslMaintenancePath", content)
+        self.assertIn("$OwnedTasks += $TaskWsl", content)
+        self.assertIn("$TasksToRestore", content)
+        self.assertNotIn(
+            "Remove-Item -LiteralPath $RuntimeRoot -Recurse",
+            content,
+        )
         self.assertIn("trap {", content)
         self.assertIn("Get-CimInstance Win32_Process", content)
         self.assertIn("/proc/[0-9]*/cmdline", content)
@@ -36,6 +47,10 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("Treating the probe as active", content)
         self.assertIn("No tasks were stopped", content)
         self.assertIn("Update-GuardianConfig", content)
+        self.assertIn("Write-GuardianLaneConfig", content)
+        self.assertIn("Initialize-GuardianLaneState", content)
+        self.assertIn("config-desktop.json", content)
+        self.assertIn("config-windows.json", content)
         self.assertIn("windows-desktop-goal-state", content)
         self.assertIn('recovery_mode = "desktop_goal_state"', content)
         self.assertIn("app_server_url", content)
@@ -54,6 +69,8 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("[string[]]$DesktopThreadId", content)
         self.assertIn("desktop_thread_ids", content)
         self.assertIn("delegated_continuity_enabled", content)
+        self.assertIn("desktop_stall_timeout_seconds", content)
+        self.assertIn("desktop_operation_stall_timeout_seconds", content)
         self.assertIn("$ReplaceDesktopThreadIds", content)
         self.assertIn("$DesktopWakeEnabled", content)
         self.assertIn(
@@ -63,13 +80,28 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("pre-0.3.0.bak", content)
         self.assertIn("__disabled_until_guardian_upgrade__", content)
         self.assertIn("2592000", content)
+        self.assertIn('"app-server-restart.request"', watchdog)
+        self.assertIn(
+            "Stop-ScheduledTask -TaskName $AppServerTaskName",
+            watchdog,
+        )
+        self.assertIn("Get-GuardianAppServerProcesses", watchdog)
+        self.assertIn("Test-GuardianAppServerListener", watchdog)
+        self.assertIn("Test-GuardianWslWatcher", watchdog)
+        self.assertIn("codex_goal_guardian*watch*--config", watchdog)
+        self.assertIn("$AppServerListenUrl", watchdog)
+        self.assertIn("Get-NetTCPConnection", watchdog)
         self.assertLess(
             content.rindex("Wait-GuardianRecoveryDrain"),
             content.index("Stop-ScheduledTask"),
         )
+        self.assertLess(
+            content.index("Set-Content -LiteralPath $MaintenancePath"),
+            content.rindex("Wait-GuardianRecoveryDrain"),
+        )
         self.assertEqual(
             content.count("New-ScheduledTaskAction -Execute $PythonwPath"),
-            4,
+            5,
         )
         self.assertGreaterEqual(content.count("--windows-hidden-child"), 2)
         self.assertIn("allowed_sources", content)
@@ -108,6 +140,7 @@ class InstallerInvariantTests(unittest.TestCase):
         )
 
         self.assertIn("CodexGoalGuardian-Windows", windows)
+        self.assertIn("CodexGoalGuardian-Desktop", windows)
         self.assertIn("CodexGoalGuardian-WSL", windows)
         self.assertIn("CodexGoalGuardian-Watchdog", windows)
         self.assertIn("CodexGoalGuardian-AppServer", windows)
@@ -133,6 +166,7 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("sys.executable", content)
         self.assertIn("CREATE_NO_WINDOW", content)
         self.assertIn('"maintenance.lock"', content)
+        self.assertIn('cd "$install_root"', content)
         self.assertNotIn("WindowsApps", content)
         self.assertNotIn("resources/app", content)
 

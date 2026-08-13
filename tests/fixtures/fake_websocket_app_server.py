@@ -116,6 +116,8 @@ class FakeWebSocketAppServer:
                     "id": request_id,
                     "result": {"thread": self._thread_payload()},
                 }
+            if method == "turn/interrupt":
+                return {"id": request_id, "result": {}}
             if method == "turn/start":
                 return {
                     "id": request_id,

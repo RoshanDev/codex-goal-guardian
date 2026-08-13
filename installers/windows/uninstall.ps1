@@ -10,6 +10,7 @@ $ErrorActionPreference = "Stop"
 
 $TaskNames = @(
     "CodexGoalGuardian-Watchdog",
+    "CodexGoalGuardian-Desktop",
     "CodexGoalGuardian-Windows",
     "CodexGoalGuardian-WSL",
     "CodexGoalGuardian-AppServer"

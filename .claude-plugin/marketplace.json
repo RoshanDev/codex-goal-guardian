@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Local development marketplace for Codex Goal Guardian.",
-    "version": "0.9.0"
+    "version": "0.10.0"
   },
   "plugins": [
     {
       "name": "codex-goal-guardian",
       "description": "Keep desktop and CLI Codex Goals recoverable without overlapping turns.",
-      "version": "0.9.0",
+      "version": "0.10.0",
       "author": {
         "name": "RoshanDev"
       },

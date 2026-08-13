@@ -121,6 +121,8 @@ for raw_line in sys.stdin:
         )
     elif method == "thread/resume":
         emit({"id": request_id, "result": {"thread": thread(), "cwd": "/workspace"}})
+    elif method == "turn/interrupt":
+        emit({"id": request_id, "result": {}})
     elif method == "turn/start":
         emit(
             {

@@ -227,10 +227,18 @@ class AppServerClient:
                     pass
 
     def request(
-        self, method: str, params: Optional[Mapping[str, Any]] = None
+        self,
+        method: str,
+        params: Optional[Mapping[str, Any]] = None,
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         self.start()
-        return self._request(method, params or {})
+        return self._request(
+            method,
+            params or {},
+            timeout_seconds=timeout_seconds,
+        )
 
     def notify(
         self, method: str, params: Optional[Mapping[str, Any]] = None
@@ -280,6 +288,13 @@ class AppServerClient:
         result = self.request("thread/resume", {"threadId": thread_id})
         return self._required_object(result, "thread", "thread/resume")
 
+    def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        self.request(
+            "turn/interrupt",
+            {"threadId": thread_id, "turnId": turn_id},
+            timeout_seconds=30,
+        )
+
     def start_turn(
         self,
         thread_id: str,
@@ -302,7 +317,11 @@ class AppServerClient:
         return self._required_object(result, "turn", "turn/start")
 
     def _request(
-        self, method: str, params: Mapping[str, Any]
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         with self._request_lock:
             self._request_id += 1
@@ -315,18 +334,25 @@ class AppServerClient:
                 }
             )
 
-            deadline = time.monotonic() + self.timeout_seconds
+            request_timeout = (
+                self.timeout_seconds
+                if timeout_seconds is None
+                else float(timeout_seconds)
+            )
+            if request_timeout <= 0:
+                raise ValueError("request timeout_seconds must be positive")
+            deadline = time.monotonic() + request_timeout
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise self._failure(
-                        f"{method} timed out after {self.timeout_seconds:g}s"
+                        f"{method} timed out after {request_timeout:g}s"
                     )
                 try:
                     message = self._messages.get(timeout=remaining)
                 except queue.Empty as error:
                     raise self._failure(
-                        f"{method} timed out after {self.timeout_seconds:g}s"
+                        f"{method} timed out after {request_timeout:g}s"
                     ) from error
 
                 if isinstance(message, _ReaderStopped):
