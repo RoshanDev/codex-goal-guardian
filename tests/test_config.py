@@ -109,6 +109,7 @@ class ConfigTests(unittest.TestCase):
                     "start_recovery_turn": False,
                     "desktop_thread_ids": [" thread-1 "],
                     "prompt_policy_retry_enabled": True,
+                    "delegated_continuity_enabled": True,
                 }
             ],
         }
@@ -129,6 +130,7 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.targets[0].desktop_thread_ids, ("thread-1",))
         self.assertTrue(config.targets[0].prompt_policy_retry_enabled)
+        self.assertTrue(config.targets[0].delegated_continuity_enabled)
 
     def test_rejects_duplicate_desktop_thread_ids(self) -> None:
         payload = {

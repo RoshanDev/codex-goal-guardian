@@ -219,7 +219,10 @@ def desktop_goal_reactivation_eligibility(
         return False, "goal_missing"
 
     goal_status = str(goal.get("status", "missing"))
-    if goal_status != "blocked":
+    recoverable_goal_statuses = {"blocked"}
+    if target.delegated_continuity_enabled:
+        recoverable_goal_statuses.add("usageLimited")
+    if goal_status not in recoverable_goal_statuses:
         return False, f"goal_{goal_status}"
 
     updated_at = _latest_activity_timestamp(thread, goal)
@@ -252,6 +255,11 @@ def desktop_goal_reactivation_eligibility(
     error = _desktop_turn_error(thread, candidate, target)
     if error is None:
         turn_status = str(candidate.get("status", "missing"))
+        if (
+            target.delegated_continuity_enabled
+            and turn_status in {"completed", "failed", "interrupted"}
+        ):
+            return True, "delegated_continuation"
         if turn_status in {"failed", "interrupted"}:
             return False, "turn_not_network_failure"
         return False, f"turn_{turn_status}"
@@ -259,6 +267,10 @@ def desktop_goal_reactivation_eligibility(
         if target.prompt_policy_retry_enabled:
             return True, "prompt_policy_retry"
         return False, "prompt_policy_rejection"
+    if target.delegated_continuity_enabled:
+        turn_status = str(candidate.get("status", "missing"))
+        if turn_status in {"completed", "failed", "interrupted"}:
+            return True, "delegated_continuation"
     if not _error_looks_like_network_failure(error):
         return False, "turn_not_network_failure"
     return True, "eligible"
@@ -1008,7 +1020,7 @@ class RecoveryEngine:
                                 and not _thread_or_turn_active(thread)
                             ):
                                 evidence_turn_id = (
-                                    _desktop_network_failure_turn_id(
+                                    _desktop_continuity_turn_id(
                                         thread,
                                         target,
                                         pending_evidence_turn_id=(
@@ -2464,6 +2476,47 @@ def _desktop_network_failure_turn_id(
     if not isinstance(error, dict):
         return None
     if not _error_looks_like_network_failure(error):
+        return None
+    return turn_id
+
+
+def _desktop_continuity_turn_id(
+    thread: dict[str, Any],
+    target: TargetConfig,
+    *,
+    pending_evidence_turn_id: str | None = None,
+) -> str | None:
+    if not target.delegated_continuity_enabled:
+        return _desktop_network_failure_turn_id(
+            thread,
+            target,
+            pending_evidence_turn_id=pending_evidence_turn_id,
+        )
+    if _thread_status(thread) not in {"idle", "systemError", "notLoaded"}:
+        return None
+    if _has_in_progress_turn(thread):
+        return None
+    if _thread_source(thread) not in target.allowed_sources:
+        return None
+    candidate = _desktop_recovery_candidate_turn(
+        thread,
+        pending_evidence_turn_id=pending_evidence_turn_id,
+    )
+    if not isinstance(candidate, dict):
+        return None
+    if str(candidate.get("status", "")) not in {
+        "completed",
+        "failed",
+        "interrupted",
+    }:
+        return None
+    turn_id = candidate.get("id")
+    if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
+        return None
+    error = _desktop_turn_error(thread, candidate, target)
+    if isinstance(error, dict) and _error_looks_like_prompt_policy_rejection(
+        error
+    ):
         return None
     return turn_id
 

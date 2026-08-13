@@ -367,6 +367,8 @@ def is_windows_shim_under_wsl(
 
 
 def running_under_wsl() -> bool:
+    if os.name == "nt":
+        return False
     if os.environ.get("WSL_DISTRO_NAME"):
         return True
     try:

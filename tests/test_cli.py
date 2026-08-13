@@ -15,6 +15,7 @@ from codex_goal_guardian.cli import (
     build_parser,
     is_windows_shim_under_wsl,
     main,
+    running_under_wsl,
 )
 from codex_goal_guardian.config import (
     DEFAULT_RECOVERY_PROMPT,
@@ -29,6 +30,11 @@ from codex_goal_guardian.state import (
 
 
 class CliRoutingTests(unittest.TestCase):
+    @patch("codex_goal_guardian.cli.os.name", "nt")
+    @patch.dict("codex_goal_guardian.cli.os.environ", {"WSL_DISTRO_NAME": "Ubuntu"})
+    def test_windows_process_is_not_misclassified_by_inherited_wsl_env(self) -> None:
+        self.assertFalse(running_under_wsl())
+
     def test_run_once_routes_dry_run_and_json_flags(self) -> None:
         arguments = build_parser().parse_args(
             ["run-once", "--config", "/tmp/config.json", "--dry-run", "--json"]

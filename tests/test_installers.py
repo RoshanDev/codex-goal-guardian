@@ -53,6 +53,7 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn('allowed_sources = @("vscode")', content)
         self.assertIn("[string[]]$DesktopThreadId", content)
         self.assertIn("desktop_thread_ids", content)
+        self.assertIn("delegated_continuity_enabled", content)
         self.assertIn("$ReplaceDesktopThreadIds", content)
         self.assertIn("$DesktopWakeEnabled", content)
         self.assertIn(

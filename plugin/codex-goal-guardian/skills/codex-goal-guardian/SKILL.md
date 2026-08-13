@@ -16,15 +16,21 @@ attempts, whether Guardian is installed, or how to inspect its recovery state.
 - Require the Desktop target's `app_server_url` to equal the user-level
   `CODEX_APP_SERVER_WS_URL`, and require the hidden shared App Server task to be
   running. A separate stdio App Server is not Desktop Goal recovery.
-- Allow the external Guardian to change only a twice-validated blocked Goal to
-  `active`. Require `source=vscode`, no `inProgress` turn, and an exact recent
-  network failure from App Server state or the task's read-only session JSONL.
+- Without delegated continuity, change only a twice-validated network-blocked
+  Goal to `active`. With explicit `delegated_continuity_enabled`, treat the
+  thread allowlist as frozen-scope delegation and continue idle blocked or
+  usage-limited Goals after completed, failed, or interrupted turns. Never
+  wake a complete, paused, budget-limited, or `inProgress` Goal. Network
+  evidence may come from App Server state or the read-only session JSONL.
 - Treat an explicit allowlist entry as opt-in authority to wake that task. After
   Goal reactivation, read thread and Goal repeatedly, call `thread/resume`, and
   call one deterministic `turn/start` only if the task remains idle. Stay
   attached until the continuation settles.
 - Deduplicate direct Desktop recovery by failed turn ID and deterministic
   client message ID.
+- For delegated continuity, make in-scope decisions without intermediate user
+  approval, while never inventing new scope or replaying completed/uncertain
+  exact-once external actions.
 - Treat the external Guardian as the native Windows/WSL CLI recovery authority.
 - For the exact `Selected model is at capacity. Please try a different model.`
   failure on a CLI or explicitly allowlisted Desktop target, require a

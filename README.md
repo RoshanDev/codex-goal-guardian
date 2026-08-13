@@ -53,12 +53,14 @@ behavior of main-process patchers such as Codex++.
 ## Recovery contract
 
 For a desktop task, the Windows watcher examines only configured
-`desktop_thread_ids`. It requires `source=vscode`, an idle thread, no
-`inProgress` turn, a blocked Goal, and a network-failed latest non-Guardian
-turn. Codex App Server can normalize some failed remote-compaction turns to
-`completed`; Guardian therefore checks the matching `task_complete` event in
-the task's append-only session JSONL when the App Server error is empty.
-Session logs are read-only and never edited.
+`desktop_thread_ids`. By default it retains the conservative network-failure
+contract. When `delegated_continuity_enabled` is explicitly enabled, the
+allowlist is also the durable delegation boundary: an idle `source=vscode`
+Goal is continued after completed, failed, interrupted, blocked, or
+usage-limited turns until the Goal becomes complete, paused/cancelled, or
+budget-limited. It never wakes an `inProgress` turn. Codex App Server can
+normalize some failed remote-compaction turns to `completed`; Guardian can
+also check matching `task_complete` evidence in the read-only session JSONL.
 
 The desktop target is invalid without `app_server_url`; Guardian fails closed
 instead of silently spawning the separate stdio runtime that cannot update the
@@ -344,7 +346,11 @@ and logs should also be deleted.
 - Migrating from 0.5.x requires one safe Desktop app restart after installation.
   Until then, the already-running app still owns its old embedded App Server
   and Guardian deliberately reports the shared runtime as unavailable.
-- Guardian cannot continue work that is waiting for user input or approval.
+- With `delegated_continuity_enabled`, Guardian instructs the Goal to make all
+  decisions already covered by its frozen objective and risk boundary without
+  intermediate approval. New scope, missing user-only information, managed
+  policy constraints, and ambiguous exact-once external effects are not
+  silently invented or replayed.
 - A platform `Invalid prompt` policy rejection is never replayed verbatim or
   treated as an older network failure. On an explicitly allowlisted Desktop
   target with `prompt_policy_retry_enabled`, Guardian may send one new fixed,
@@ -357,9 +363,9 @@ and logs should also be deleted.
 - An incompatible future App Server schema fails closed; it never falls back
   to direct database edits or UI automation.
 - An explicit `desktop_thread_ids` entry opts that task into external wake.
-  Guardian changes only a network-blocked Goal to active, repeatedly rejects a
-  live/in-progress runtime, resumes the persisted task, and starts at most one
-  deterministic continuation if it remains idle. The absence of an upstream
+  With delegated continuity enabled, Guardian repeatedly supervises each new
+  terminal turn, resumes persisted state, and starts one deterministic
+  continuation per evidence turn. The absence of an upstream
   subscriber-presence signal leaves a small residual ownership race.
 - CLI recovery is conservative: any matching live native CLI process delays
   takeover, including a different task using that same configured executable.

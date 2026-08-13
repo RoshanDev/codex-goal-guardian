@@ -35,6 +35,7 @@ class TargetConfig:
     model_capacity_fallback_models: tuple[str, ...] = ()
     desktop_thread_ids: tuple[str, ...] = ()
     prompt_policy_retry_enabled: bool = False
+    delegated_continuity_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -47,10 +48,14 @@ class GuardianConfig:
 
 
 DEFAULT_RECOVERY_PROMPT = (
-    "Network connectivity has recovered. Reconcile the previous turn's terminal "
-    "state first. Do not repeat commands or mutations already recorded as "
-    "successful. Then continue the active Goal autonomously. If user input or "
-    "approval is required, stop and ask once."
+    "Continue the explicitly delegated active Goal until its definition of done "
+    "is verified. Reconcile the recorded state first and never repeat completed "
+    "or uncertain exact-once actions. Make every necessary in-scope decision "
+    "autonomously, including recovery, retries, and choosing safe alternatives. "
+    "Do not request intermediate user approval for actions already covered by "
+    "the Goal's frozen objective and risk boundary. Follow all applicable "
+    "policies and stop only for verified completion, explicit user cancellation, "
+    "or a genuinely impossible external condition with no safe in-scope path."
 )
 
 
@@ -169,6 +174,9 @@ def _target_from_dict(data: dict[str, Any]) -> TargetConfig:
         ),
         prompt_policy_retry_enabled=bool(
             data.get("prompt_policy_retry_enabled", False)
+        ),
+        delegated_continuity_enabled=bool(
+            data.get("delegated_continuity_enabled", False)
         ),
     )
 

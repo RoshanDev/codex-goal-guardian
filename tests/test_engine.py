@@ -250,6 +250,48 @@ class DesktopGoalReactivationEligibilityTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertEqual(reason, "goal_paused")
 
+    def test_delegated_usage_limited_goal_can_resume(self) -> None:
+        target = TargetConfig(
+            name=self.target.name,
+            command=self.target.command,
+            codex_home=self.target.codex_home,
+            recovery_mode=self.target.recovery_mode,
+            allowed_sources=self.target.allowed_sources,
+            max_thread_age_seconds=self.target.max_thread_age_seconds,
+            delegated_continuity_enabled=True,
+        )
+        eligible, reason = desktop_goal_reactivation_eligibility(
+            make_thread(source="vscode"),
+            {"status": "usageLimited"},
+            target,
+            now=150,
+            already_recovered=False,
+        )
+
+        self.assertTrue(eligible)
+        self.assertEqual(reason, "delegated_continuation")
+
+    def test_delegated_budget_limited_goal_is_not_extended(self) -> None:
+        target = TargetConfig(
+            name=self.target.name,
+            command=self.target.command,
+            codex_home=self.target.codex_home,
+            recovery_mode=self.target.recovery_mode,
+            allowed_sources=self.target.allowed_sources,
+            max_thread_age_seconds=self.target.max_thread_age_seconds,
+            delegated_continuity_enabled=True,
+        )
+        eligible, reason = desktop_goal_reactivation_eligibility(
+            make_thread(source="vscode"),
+            {"status": "budgetLimited"},
+            target,
+            now=150,
+            already_recovered=False,
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "goal_budgetLimited")
+
     def test_active_turn_is_never_reactivated(self) -> None:
         eligible, reason = desktop_goal_reactivation_eligibility(
             make_thread(
@@ -280,6 +322,53 @@ class DesktopGoalReactivationEligibilityTests(unittest.TestCase):
 
         self.assertFalse(eligible)
         self.assertEqual(reason, "turn_not_network_failure")
+
+    def test_delegated_goal_continues_after_non_network_failure(self) -> None:
+        target = TargetConfig(
+            name=self.target.name,
+            command=self.target.command,
+            codex_home=self.target.codex_home,
+            recovery_mode=self.target.recovery_mode,
+            allowed_sources=self.target.allowed_sources,
+            max_thread_age_seconds=self.target.max_thread_age_seconds,
+            delegated_continuity_enabled=True,
+        )
+        eligible, reason = desktop_goal_reactivation_eligibility(
+            make_thread(
+                source="vscode",
+                error_message="tool command returned exit code 2",
+            ),
+            self.goal,
+            target,
+            now=150,
+            already_recovered=False,
+        )
+
+        self.assertTrue(eligible)
+        self.assertEqual(reason, "delegated_continuation")
+
+    def test_delegated_goal_continues_after_completed_approval_wait(self) -> None:
+        target = TargetConfig(
+            name=self.target.name,
+            command=self.target.command,
+            codex_home=self.target.codex_home,
+            recovery_mode=self.target.recovery_mode,
+            allowed_sources=self.target.allowed_sources,
+            max_thread_age_seconds=self.target.max_thread_age_seconds,
+            delegated_continuity_enabled=True,
+        )
+        thread = make_thread(source="vscode", turn_status="completed")
+        thread["turns"][-1]["error"] = None
+        eligible, reason = desktop_goal_reactivation_eligibility(
+            thread,
+            self.goal,
+            target,
+            now=150,
+            already_recovered=False,
+        )
+
+        self.assertTrue(eligible)
+        self.assertEqual(reason, "delegated_continuation")
 
     def test_prompt_policy_rejection_is_never_reactivated(self) -> None:
         eligible, reason = desktop_goal_reactivation_eligibility(
