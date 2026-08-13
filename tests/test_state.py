@@ -7,12 +7,14 @@ from codex_goal_guardian.state import (
     StateCorruptionError,
     StateStore,
     default_state,
+    delegated_cli_recovery_record,
     enqueue_desktop_recovery_request,
     finish_desktop_recovery_request,
     mark_recovered,
     model_capacity_recovery_record,
     pending_desktop_recovery_requests,
     save_model_capacity_recovery,
+    save_delegated_cli_recovery,
     transition_health,
     was_recovered,
 )
@@ -146,6 +148,30 @@ class HealthTransitionTests(unittest.TestCase):
                 "failure_turn_id": "turn-a",
                 "attempts_in_model": 3,
                 "next_retry_at": 600,
+                "recorded_at": 200,
+            },
+        )
+
+    def test_delegated_cli_record_is_persisted_per_evidence_turn(self) -> None:
+        state = default_state()
+        save_delegated_cli_recovery(
+            state,
+            "wsl",
+            "thread-a",
+            {
+                "evidence_turn_id": "turn-a",
+                "recovery_turn_id": "turn-b",
+                "action": "continuation_started",
+            },
+            now=200,
+        )
+
+        self.assertEqual(
+            delegated_cli_recovery_record(state, "wsl", "thread-a"),
+            {
+                "evidence_turn_id": "turn-a",
+                "recovery_turn_id": "turn-b",
+                "action": "continuation_started",
                 "recorded_at": 200,
             },
         )

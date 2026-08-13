@@ -32,6 +32,14 @@ attempts, whether Guardian is installed, or how to inspect its recovery state.
   approval, while never inventing new scope or replaying completed/uncertain
   exact-once external actions.
 - Treat the external Guardian as the native Windows/WSL CLI recovery authority.
+- Require one nonblocking supervisor lease per state file. A duplicate watcher
+  or timer must exit successfully as `supervisor_already_active`, never wait on
+  the active supervisor's state lock.
+- With delegated continuity enabled for CLI, inspect persisted Goals on every
+  healthy pass after the matching native process exits. Continue active,
+  blocked, or usage-limited Goals from each new terminal evidence turn, using
+  a persisted deterministic ledger. Preserve complete, paused, budget-limited,
+  stale, foreign-source, and `inProgress` Goals.
 - For the exact `Selected model is at capacity. Please try a different model.`
   failure on a CLI or explicitly allowlisted Desktop target, require a
   non-empty configured `model_capacity_fallback_models` list, an active Goal,
@@ -64,10 +72,9 @@ attempts, whether Guardian is installed, or how to inspect its recovery state.
   absent), then relaunch only ChatGPT. Do not stop a Windows/WSL Guardian or
   Codex CLI process. Report that Desktop shared-runtime recovery remains
   disabled until its listener is repaired and the installer is rerun.
-- A live `run-once` is appropriate only after an observed down-to-up health
-  transition for CLI recovery. A watched or explicitly requested Desktop task
-  may be processed on any confirmed healthy pass because short disconnects can
-  occur between probes.
+- A delegated CLI or watched Desktop task may be processed on any confirmed
+  healthy pass. Conservative non-delegated CLI recovery still requires an
+  observed down-to-up health transition.
 - Report the target, outage generation, thread ID, and action without exposing
   prompt text or authentication data.
 

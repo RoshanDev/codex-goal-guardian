@@ -219,7 +219,9 @@ cd ~/Developer/codex-goal-guardian
 
 Add `--with-systemd` when you want the optional WSL-only timer. The Windows WSL
 watcher already starts the distro and checks every 15 seconds, so the timer is
-a fallback rather than a requirement. Configure a proxy only when it is
+a fallback rather than a requirement. A runtime-wide nonblocking supervisor
+lease makes an accidentally duplicated watch or timer exit cleanly instead of
+contending for Goal state. Configure a proxy only when it is
 reachable from WSL; Windows loopback proxy ports are not always forwarded.
 For a Windows proxy listening on port 7890, verify the hostname first, then use:
 
@@ -366,9 +368,16 @@ and logs should also be deleted.
   With delegated continuity enabled, Guardian repeatedly supervises each new
   terminal turn, resumes persisted state, and starts one deterministic
   continuation per evidence turn. The absence of an upstream
-  subscriber-presence signal leaves a small residual ownership race.
-- CLI recovery is conservative: any matching live native CLI process delays
-  takeover, including a different task using that same configured executable.
+subscriber-presence signal leaves a small residual ownership race.
+- With delegated continuity enabled on a CLI target, Guardian supervises every
+  healthy pass after the native owner exits, rather than waiting for a network
+  down-to-up transition. It persists one ledger entry per evidence turn and
+  starts at most one deterministic continuation for that turn. Any matching
+  live native CLI process delays takeover, including a different task using
+  that same configured executable.
+- One supervisor lease is held for the lifetime of a watcher or `run-once`
+  pass. Duplicate Windows/WSL schedulers report `supervisor_already_active`
+  without delaying the active supervisor.
 - Health restoration must be observed by the scheduler. Installing while the
   network is already healthy does not synthesize an outage.
 

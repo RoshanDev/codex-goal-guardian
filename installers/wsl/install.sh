@@ -179,6 +179,7 @@ payload = {
             "thread_limit": 50,
             "resume_grace_seconds": 2,
             "start_recovery_turn": True,
+            "delegated_continuity_enabled": True,
         }
     ],
 }
@@ -189,6 +190,27 @@ PY
     printf '[Codex Goal Guardian] wrote %s\n' "$config_path"
 else
     printf '[Codex Goal Guardian] preserved %s (use --force-config to replace)\n' "$config_path"
+fi
+
+if [ "$dry_run" -eq 0 ]; then
+    GUARDIAN_CONFIG_PATH="$config_path" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["GUARDIAN_CONFIG_PATH"])
+payload = json.loads(path.read_text(encoding="utf-8-sig"))
+changed = False
+for target in payload.get("targets", []):
+    if target.get("recovery_mode", "cli_turn") == "cli_turn":
+        if target.get("delegated_continuity_enabled") is not True:
+            target["delegated_continuity_enabled"] = True
+            changed = True
+if changed:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+PY
 fi
 
 if [ "$with_systemd" -eq 1 ]; then

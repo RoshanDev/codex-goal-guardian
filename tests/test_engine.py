@@ -660,6 +660,7 @@ class _FakeClient:
         self.reactivate_calls = 0
         self.read_calls = 0
         self.list_calls = 0
+        self.goal_calls = 0
 
     def __enter__(self) -> "_FakeClient":
         return self
@@ -672,6 +673,7 @@ class _FakeClient:
         return [self.listed_thread]
 
     def get_goal(self, thread_id: str) -> dict:
+        self.goal_calls += 1
         return dict(self.goal)
 
     def reactivate_goal(self, thread_id: str) -> dict:
@@ -733,6 +735,15 @@ class _CapacityClient(_FakeClient):
         )
         self.listed_thread["turns"][0]["id"] = turn_id
         return {"id": turn_id, "status": "inProgress"}
+
+
+class _NoGoalClient(_FakeClient):
+    def get_goal(self, thread_id: str) -> None:
+        self.goal_calls += 1
+        return None
+
+    def read_thread(self, thread_id: str, *, include_turns: bool) -> dict:
+        raise AssertionError("a no-Goal CLI thread must not load full history")
 
 
 class _ImmediateCapacityClient(_CapacityClient):
@@ -1971,6 +1982,18 @@ class RecoveryEngineTests(unittest.TestCase):
 
         self.assertEqual(client.timeout_seconds, 120)
 
+    def test_delegated_cli_timeout_allows_large_task_resume(self) -> None:
+        target = TargetConfig(
+            name="wsl",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            delegated_continuity_enabled=True,
+        )
+
+        client = RecoveryEngine._default_client(target)
+
+        self.assertEqual(client.timeout_seconds, 120)
+
     def test_desktop_mode_fails_closed_if_accounting_changes(self) -> None:
         desktop_target = TargetConfig(
             name="windows-desktop-goal-state",
@@ -2154,6 +2177,140 @@ class RecoveryEngineTests(unittest.TestCase):
 
         save.assert_not_called()
         self.assertFalse(report["targets"][0]["state_changed"])
+    def test_delegated_cli_continues_without_network_outage_and_deduplicates(
+        self,
+    ) -> None:
+        target = TargetConfig(
+            name="wsl",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            allowed_sources=("cli", "exec"),
+            max_thread_age_seconds=100,
+            resume_grace_seconds=0,
+            delegated_continuity_enabled=True,
+        )
+        config = GuardianConfig(
+            state_path=self.config.state_path,
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        first_client = _FakeClient()
+        first_engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: first_client,
+            process_probe=lambda _: False,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        first = first_engine.run_once(config)
+
+        self.assertEqual(first["targets"][0]["status"], "recovered")
+        self.assertEqual(first_client.resume_calls, 1)
+        self.assertEqual(first_client.start_calls, 1)
+        self.assertEqual(
+            first["targets"][0]["actions"][0]["action"],
+            "delegated_cli_continuation_started",
+        )
+
+        second_client = _FakeClient()
+        second_engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: second_client,
+            process_probe=lambda _: False,
+            now=lambda: 121,
+            sleep=lambda _: None,
+        )
+        second = second_engine.run_once(config)
+
+        self.assertEqual(second_client.resume_calls, 0)
+        self.assertEqual(second_client.start_calls, 0)
+        self.assertEqual(
+            second["targets"][0]["skipped"][0]["reason"],
+            "already_recovered_turn",
+        )
+
+    def test_delegated_cli_skips_full_history_when_goal_is_missing(self) -> None:
+        target = TargetConfig(
+            name="wsl",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            delegated_continuity_enabled=True,
+        )
+        client = _NoGoalClient()
+        config = GuardianConfig(
+            state_path=self.config.state_path,
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: False,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(report["targets"][0]["status"], "monitoring")
+        self.assertEqual(client.goal_calls, 1)
+
+        second_client = _NoGoalClient()
+        second_engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: second_client,
+            process_probe=lambda _: False,
+            now=lambda: 121,
+            sleep=lambda _: None,
+        )
+        second_engine.run_once(config)
+        self.assertEqual(second_client.goal_calls, 0)
+
+    def test_delegated_cli_reactivates_blocked_goal(self) -> None:
+        target = TargetConfig(
+            name="wsl",
+            command=("codex",),
+            codex_home=self.target.codex_home,
+            max_thread_age_seconds=100,
+            resume_grace_seconds=0,
+            delegated_continuity_enabled=True,
+        )
+        goal = {
+            "threadId": "thread-1",
+            "objective": "finish safely",
+            "status": "blocked",
+            "tokenBudget": 40_000,
+            "tokensUsed": 100,
+            "timeUsedSeconds": 20,
+            "createdAt": 90,
+            "updatedAt": 110,
+        }
+        client = _FakeClient(goal=goal)
+        config = GuardianConfig(
+            state_path=self.config.state_path,
+            log_path=self.config.log_path,
+            health=self.config.health,
+            targets=(target,),
+            recovery_prompt=self.config.recovery_prompt,
+        )
+        engine = RecoveryEngine(
+            probe=self.healthy,
+            client_factory=lambda _: client,
+            process_probe=lambda _: False,
+            now=lambda: 120,
+            sleep=lambda _: None,
+        )
+
+        report = engine.run_once(config)
+
+        self.assertEqual(report["targets"][0]["status"], "recovered")
+        self.assertEqual(client.reactivate_calls, 1)
+        self.assertEqual(client.start_calls, 1)
 
 
 if __name__ == "__main__":

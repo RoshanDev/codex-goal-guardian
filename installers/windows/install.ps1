@@ -148,6 +148,7 @@ function Update-GuardianConfig {
         if ($null -eq $WindowsTarget.PSObject.Properties["recovery_mode"]) {
             Set-JsonProperty $WindowsTarget "recovery_mode" "cli_turn"
         }
+        Set-JsonProperty $WindowsTarget "delegated_continuity_enabled" $true
     }
 
     $UpdatedJson = $Existing | ConvertTo-Json -Depth 8
@@ -593,6 +594,7 @@ $Configuration = [ordered]@{
             thread_limit = 50
             resume_grace_seconds = 2
             start_recovery_turn = $true
+            delegated_continuity_enabled = $true
         },
         $DesktopGoalStateTarget
     )

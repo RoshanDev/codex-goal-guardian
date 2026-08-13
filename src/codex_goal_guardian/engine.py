@@ -19,6 +19,7 @@ from .ownership import (
 from .state import (
     StateStore,
     desktop_direct_recovery_record,
+    delegated_cli_recovery_record,
     finish_desktop_recovery_request,
     is_recovery_pending,
     mark_desktop_direct_recovery,
@@ -28,6 +29,7 @@ from .state import (
     recovery_record,
     recovery_records,
     save_model_capacity_recovery,
+    save_delegated_cli_recovery,
     set_recovery_pending,
     transition_health,
 )
@@ -405,6 +407,19 @@ class RecoveryEngine:
                         target_report["status"] = "monitoring"
                     continue
 
+                if target.delegated_continuity_enabled:
+                    delegated_status = self._supervise_delegated_cli(
+                        config,
+                        target,
+                        state,
+                        store,
+                        target_report,
+                        timestamp,
+                        dry_run=dry_run,
+                    )
+                    target_report["status"] = delegated_status
+                    continue
+
                 if transition.recover_now:
                     set_recovery_pending(state, target.name, True)
                 elif (
@@ -455,6 +470,221 @@ class RecoveryEngine:
             if state != initial_state:
                 store.save(state)
         return report
+
+    def _supervise_delegated_cli(
+        self,
+        config: GuardianConfig,
+        target: TargetConfig,
+        state: dict[str, Any],
+        store: StateStore,
+        report: dict[str, Any],
+        now: int,
+        *,
+        dry_run: bool,
+    ) -> str:
+        if self._process_probe(target):
+            report["skipped"].append(
+                {"thread_id": None, "reason": "cli_process_running"}
+            )
+            return "monitoring"
+        acted = False
+        try:
+            with self._client_factory(target) as client:
+                for summary in client.list_threads(limit=target.thread_limit):
+                    if not isinstance(summary, dict):
+                        continue
+                    thread_id = summary.get("id")
+                    if not isinstance(thread_id, str) or not thread_id:
+                        continue
+                    summary_source = _thread_source(summary)
+                    if summary_source not in target.allowed_sources:
+                        continue
+                    summary_updated = _timestamp_seconds(
+                        summary.get("recencyAt", summary.get("updatedAt"))
+                    )
+                    if (
+                        summary_updated is not None
+                        and now - summary_updated > target.max_thread_age_seconds
+                    ):
+                        continue
+                    summary_record = delegated_cli_recovery_record(
+                        state, target.name, thread_id
+                    )
+                    if (
+                        summary_updated is not None
+                        and isinstance(summary_record, dict)
+                        and summary_record.get("action") == "no_goal_observed"
+                        and summary_record.get("summary_updated_at")
+                        == summary_updated
+                    ):
+                        continue
+                    goal = client.get_goal(thread_id)
+                    if not isinstance(goal, dict):
+                        if not dry_run:
+                            save_delegated_cli_recovery(
+                                state,
+                                target.name,
+                                thread_id,
+                                {
+                                    "action": "no_goal_observed",
+                                    "summary_updated_at": summary_updated,
+                                },
+                                now=now,
+                            )
+                            store.save(state)
+                        continue
+                    thread = client.read_thread(thread_id, include_turns=True)
+                    eligible, reason, evidence = _delegated_cli_eligibility(
+                        thread, goal, target, now=now
+                    )
+                    if not eligible:
+                        if reason not in {"goal_missing", "goal_complete"}:
+                            report["skipped"].append(
+                                {"thread_id": thread_id, "reason": reason}
+                            )
+                        continue
+                    assert isinstance(evidence, dict)
+                    evidence_turn_id = str(evidence["id"])
+                    record = delegated_cli_recovery_record(
+                        state, target.name, thread_id
+                    )
+                    evidence_error = evidence.get("error")
+                    if (
+                        isinstance(evidence_error, dict)
+                        and _error_looks_like_prompt_policy_rejection(evidence_error)
+                        and isinstance(record, dict)
+                        and record.get("recovery_turn_id") == evidence_turn_id
+                    ):
+                        report["skipped"].append(
+                            {
+                                "thread_id": thread_id,
+                                "reason": "prompt_policy_retry_exhausted",
+                            }
+                        )
+                        continue
+                    if (
+                        isinstance(record, dict)
+                        and record.get("evidence_turn_id") == evidence_turn_id
+                    ):
+                        report["skipped"].append(
+                            {"thread_id": thread_id, "reason": "already_recovered_turn"}
+                        )
+                        continue
+                    if dry_run:
+                        report["actions"].append(
+                            {
+                                "thread_id": thread_id,
+                                "action": "would_continue_delegated_cli_goal",
+                                "evidence_turn_id": evidence_turn_id,
+                            }
+                        )
+                        acted = True
+                        continue
+
+                    fresh_thread = client.read_thread(thread_id, include_turns=True)
+                    fresh_goal = client.get_goal(thread_id)
+                    fresh_ok, fresh_reason, fresh_evidence = (
+                        _delegated_cli_eligibility(
+                            fresh_thread, fresh_goal, target, now=now
+                        )
+                    )
+                    if (
+                        not fresh_ok
+                        or not isinstance(fresh_evidence, dict)
+                        or fresh_evidence.get("id") != evidence_turn_id
+                    ):
+                        report["skipped"].append(
+                            {
+                                "thread_id": thread_id,
+                                "reason": fresh_reason if not fresh_ok else "recovery_evidence_changed",
+                                "stage": "pre_mutation",
+                            }
+                        )
+                        continue
+                    assert isinstance(fresh_goal, dict)
+                    if fresh_goal.get("status") in {"blocked", "usageLimited"}:
+                        reactivated = client.reactivate_goal(thread_id)
+                        _verify_goal_reactivation(fresh_goal, reactivated)
+                    client.resume_thread(thread_id)
+                    if target.resume_grace_seconds > 0:
+                        self._sleep(target.resume_grace_seconds)
+                    resumed = client.read_thread(thread_id, include_turns=True)
+                    if _thread_or_turn_active(resumed):
+                        recovery_turn_id = _latest_turn_id(resumed)
+                    else:
+                        message_id = _delegated_cli_message_id(
+                            target.name, thread_id, evidence_turn_id
+                        )
+                        turn = client.start_turn(
+                            thread_id,
+                            prompt=config.recovery_prompt,
+                            client_user_message_id=message_id,
+                        )
+                        recovery_turn_id = (
+                            str(turn.get("id")) if turn.get("id") is not None else None
+                        )
+                    save_delegated_cli_recovery(
+                        state,
+                        target.name,
+                        thread_id,
+                        {
+                            "evidence_turn_id": evidence_turn_id,
+                            "recovery_turn_id": recovery_turn_id,
+                            "action": "continuation_started",
+                        },
+                        now=now,
+                    )
+                    store.save(state)
+                    report["actions"].append(
+                        {
+                            "thread_id": thread_id,
+                            "action": "delegated_cli_continuation_started",
+                            "evidence_turn_id": evidence_turn_id,
+                            "turn_id": recovery_turn_id,
+                        }
+                    )
+                    acted = True
+                    settled_thread, settled_goal = self._wait_until_settled(
+                        client, thread_id, target
+                    )
+                    save_delegated_cli_recovery(
+                        state,
+                        target.name,
+                        thread_id,
+                        {
+                            "evidence_turn_id": evidence_turn_id,
+                            "recovery_turn_id": recovery_turn_id,
+                            "action": "continuation_settled",
+                            "settled_turn_id": _latest_turn_id(settled_thread),
+                            "goal_status": (
+                                settled_goal.get("status")
+                                if isinstance(settled_goal, dict)
+                                else None
+                            ),
+                        },
+                        now=now,
+                    )
+                    store.save(state)
+                    report["actions"].append(
+                        {
+                            "thread_id": thread_id,
+                            "action": "delegated_cli_continuation_settled",
+                            "turn_id": recovery_turn_id,
+                            "goal_status": (
+                                settled_goal.get("status")
+                                if isinstance(settled_goal, dict)
+                                else None
+                            ),
+                        }
+                    )
+        except Exception as error:
+            report["errors"].append(
+                {"thread_id": None, "error": _safe_exception(error)}
+            )
+            return "error"
+        if dry_run:
+            return "dry_run"
+        return "recovered" if acted else "monitoring"
 
     def _recover_model_capacity(
         self,
@@ -2132,7 +2362,10 @@ class RecoveryEngine:
             codex_home=target.codex_home,
             timeout_seconds=(
                 120
-                if target.recovery_mode == "desktop_goal_state"
+                if (
+                    target.recovery_mode == "desktop_goal_state"
+                    or target.delegated_continuity_enabled
+                )
                 else 15
             ),
             websocket_url=target.app_server_url,
@@ -2164,6 +2397,62 @@ def _thread_status(thread: dict[str, Any]) -> str:
     if isinstance(status, dict):
         return str(status.get("type", ""))
     return str(status or "")
+
+
+def _delegated_cli_eligibility(
+    thread: dict[str, Any],
+    goal: Optional[dict[str, Any]],
+    target: TargetConfig,
+    *,
+    now: int,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    if not isinstance(goal, dict):
+        return False, "goal_missing", None
+    goal_status = str(goal.get("status", "missing"))
+    if goal_status not in {"active", "blocked", "usageLimited"}:
+        return False, f"goal_{goal_status}", None
+    updated_at = _latest_activity_timestamp(thread, goal)
+    if updated_at is None:
+        return False, "thread_updated_at_missing", None
+    if now - updated_at > target.max_thread_age_seconds:
+        return False, "thread_stale", None
+    status = _thread_status(thread)
+    if status == "active":
+        return False, "thread_active", None
+    if status not in {"idle", "systemError", "notLoaded"}:
+        return False, f"thread_{status or 'missing'}", None
+    source = _thread_source(thread)
+    if source not in target.allowed_sources:
+        return False, f"source_{source or 'missing'}", None
+    if _has_in_progress_turn(thread):
+        return False, "turn_in_progress", None
+    evidence = _latest_recovery_candidate_turn(thread)
+    if not isinstance(evidence, dict):
+        return False, "turn_missing", None
+    turn_status = str(evidence.get("status", "missing"))
+    if turn_status not in {"completed", "failed", "interrupted"}:
+        return False, f"turn_{turn_status}", None
+    turn_id = evidence.get("id")
+    if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
+        return False, "turn_id_missing", None
+    error = evidence.get("error")
+    if (
+        target.model_capacity_fallback_models
+        and isinstance(error, dict)
+        and _error_looks_like_model_capacity_failure(error)
+    ):
+        return False, "model_capacity_specialized_recovery", None
+    return True, "delegated_continuation", evidence
+
+
+def _delegated_cli_message_id(
+    target_name: str, thread_id: str, evidence_turn_id: str
+) -> str:
+    seed = (
+        "codex-goal-guardian:delegated-cli:"
+        f"{target_name}:{thread_id}:{evidence_turn_id}"
+    )
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
 
 def _thread_source(thread: dict[str, Any]) -> str:

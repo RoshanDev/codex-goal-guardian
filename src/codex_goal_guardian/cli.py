@@ -17,7 +17,11 @@ from .config import GuardianConfig, load_config
 from .engine import RecoveryEngine
 from .health import probe_health
 from .ownership import desktop_uses_shared_app_server
-from .state import StateStore, enqueue_desktop_recovery_request
+from .state import (
+    StateStore,
+    enqueue_desktop_recovery_request,
+    singleton_supervisor,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -103,9 +107,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if report["ok"] else 2
         if arguments.command_name == "run-once":
             config = load_config(arguments.config)
-            report = RecoveryEngine().run_once(
-                config, dry_run=arguments.dry_run
-            )
+            with singleton_supervisor(config.state_path) as acquired:
+                if not acquired:
+                    report = _supervisor_active_report()
+                else:
+                    report = RecoveryEngine().run_once(
+                        config, dry_run=arguments.dry_run
+                    )
             if _report_worth_logging(report):
                 append_json_log(
                     config.log_path, {"kind": "run_once", "report": report}
@@ -453,28 +461,40 @@ def default_hook_log_path() -> Path:
 
 def _watch(arguments: argparse.Namespace) -> int:
     config = load_config(arguments.config)
-    engine = RecoveryEngine()
-    last_log_fingerprint: str | None = None
-    last_logged_at = 0.0
-    while True:
-        report = engine.run_once(config, dry_run=arguments.dry_run)
-        if _report_worth_logging(report):
-            fingerprint = _report_log_fingerprint(report)
-            current_time = time.monotonic()
-            if (
-                fingerprint != last_log_fingerprint
-                or current_time - last_logged_at >= 300
-            ):
-                append_json_log(
-                    config.log_path, {"kind": "watch", "report": report}
-                )
-                last_log_fingerprint = fingerprint
-                last_logged_at = current_time
-        _emit(report, arguments.json_output)
-        delay = arguments.interval
-        if _report_has_errors(report):
-            delay = max(delay, 60)
-        time.sleep(delay)
+    with singleton_supervisor(config.state_path) as acquired:
+        if not acquired:
+            _emit(_supervisor_active_report(), arguments.json_output)
+            return 0
+        engine = RecoveryEngine()
+        last_log_fingerprint: str | None = None
+        last_logged_at = 0.0
+        while True:
+            report = engine.run_once(config, dry_run=arguments.dry_run)
+            if _report_worth_logging(report):
+                fingerprint = _report_log_fingerprint(report)
+                current_time = time.monotonic()
+                if (
+                    fingerprint != last_log_fingerprint
+                    or current_time - last_logged_at >= 300
+                ):
+                    append_json_log(
+                        config.log_path, {"kind": "watch", "report": report}
+                    )
+                    last_log_fingerprint = fingerprint
+                    last_logged_at = current_time
+            _emit(report, arguments.json_output)
+            delay = arguments.interval
+            if _report_has_errors(report):
+                delay = max(delay, 60)
+            time.sleep(delay)
+
+
+def _supervisor_active_report() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "supervisor_already_active",
+        "targets": [],
+    }
 
 
 def _run_bounded(

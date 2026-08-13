@@ -96,6 +96,7 @@ class InstallerInvariantTests(unittest.TestCase):
         self.assertIn("GUARDIAN_COMMAND_1", content)
         self.assertIn('"allowed_sources"', content)
         self.assertIn('"recovery_mode": "cli_turn"', content)
+        self.assertIn('"delegated_continuity_enabled": True', content)
         self.assertNotIn("/mnt/c/", content)
 
     def test_uninstallers_remove_only_guardian_owned_names(self) -> None:

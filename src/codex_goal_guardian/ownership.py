@@ -88,6 +88,8 @@ def _proc_cli_process_is_running(command: Sequence[str]) -> bool:
             for item in raw.split(b"\0")
             if item
         ]
+        if _is_app_server_arguments(arguments):
+            continue
         if _arguments_match_command(arguments, command):
             return True
     return False
@@ -102,6 +104,8 @@ def _windows_cli_process_is_running(command: Sequence[str]) -> bool:
             str(record.get(key) or "")
             for key in ("ExecutablePath", "CommandLine")
         )
+        if _is_app_server_command_line(line):
+            continue
         if _command_line_matches(line, command):
             return True
     return False
@@ -161,6 +165,16 @@ def _command_line_matches(line: str, command: Sequence[str]) -> bool:
     ]
     return bool(expected) and all(
         _command_line_contains(normalized_line, item) for item in expected
+    )
+
+
+def _is_app_server_arguments(arguments: Iterable[str]) -> bool:
+    return any(item.casefold() == "app-server" for item in arguments)
+
+
+def _is_app_server_command_line(line: str) -> bool:
+    return bool(
+        re.search(r"(?i)(?:^|\s|[\"'])app-server(?:$|\s|[\"'])", line)
     )
 
 

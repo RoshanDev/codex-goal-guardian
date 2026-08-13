@@ -26,6 +26,7 @@ from codex_goal_guardian.config import (
 from codex_goal_guardian.state import (
     StateStore,
     pending_desktop_recovery_requests,
+    singleton_supervisor,
 )
 
 
@@ -104,7 +105,10 @@ class CliRoutingTests(unittest.TestCase):
         with (
             patch(
                 "codex_goal_guardian.cli.load_config",
-                return_value=SimpleNamespace(log_path="/tmp/guardian.jsonl"),
+                return_value=SimpleNamespace(
+                    log_path="/tmp/guardian.jsonl",
+                    state_path="/tmp/guardian-test-state.json",
+                ),
             ),
             patch("codex_goal_guardian.cli.RecoveryEngine", return_value=engine),
             patch("codex_goal_guardian.cli.append_json_log"),
@@ -123,6 +127,32 @@ class CliRoutingTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         engine.run_once.assert_called_once_with(ANY, dry_run=True)
         self.assertEqual(json.loads(output.getvalue()), report)
+
+    def test_run_once_skips_when_another_supervisor_holds_the_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = str(Path(temporary) / "state.json")
+            config = SimpleNamespace(
+                log_path=str(Path(temporary) / "guardian.jsonl"),
+                state_path=state_path,
+            )
+            output = io.StringIO()
+            with singleton_supervisor(state_path) as acquired:
+                self.assertTrue(acquired)
+                with (
+                    patch("codex_goal_guardian.cli.load_config", return_value=config),
+                    patch("codex_goal_guardian.cli.RecoveryEngine") as engine,
+                    redirect_stdout(output),
+                ):
+                    exit_code = main(
+                        ["run-once", "--config", "/tmp/config.json", "--json"]
+                    )
+
+            self.assertEqual(exit_code, 0)
+            engine.assert_not_called()
+            self.assertEqual(
+                json.loads(output.getvalue())["status"],
+                "supervisor_already_active",
+            )
 
     def test_desktop_request_is_queued_and_duplicate_is_coalesced(
         self,

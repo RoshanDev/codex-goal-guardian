@@ -11,6 +11,8 @@ from codex_goal_guardian.ownership import (
     _arguments_match_command,
     _command_line_matches,
     _desktop_processes_use_shared_app_server,
+    _is_app_server_arguments,
+    _is_app_server_command_line,
     cli_process_is_running,
     desktop_uses_shared_app_server,
 )
@@ -20,6 +22,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OwnershipProbeTests(unittest.TestCase):
+    def test_app_server_process_is_not_treated_as_cli_owner(self) -> None:
+        self.assertTrue(
+            _is_app_server_arguments(
+                ["/usr/bin/node", "/opt/codex/bin/codex.js", "app-server"]
+            )
+        )
+        self.assertTrue(
+            _is_app_server_command_line(
+                '"C:/Program Files/nodejs/node.exe" "C:/codex.js" app-server'
+            )
+        )
+
     def test_node_entrypoint_survives_different_node_argv_zero(self) -> None:
         command = (
             "/opt/node/bin/node",

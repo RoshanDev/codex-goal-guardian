@@ -48,6 +48,7 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
             "desktop_recovery_requests": {},
             "desktop_direct_recoveries": {},
             "model_capacity_recoveries": {},
+            "delegated_cli_recoveries": {},
         },
     )
     target.setdefault("health", "unknown")
@@ -62,6 +63,7 @@ def _target_state(state: MutableMapping[str, Any], target_name: str) -> dict[str
     target.setdefault("desktop_recovery_requests", {})
     target.setdefault("desktop_direct_recoveries", {})
     target.setdefault("model_capacity_recoveries", {})
+    target.setdefault("delegated_cli_recoveries", {})
     return target
 
 
@@ -337,6 +339,46 @@ def save_model_capacity_recovery(
         records.pop(key, None)
 
 
+def delegated_cli_recovery_record(
+    state: MutableMapping[str, Any], target_name: str, thread_id: str
+) -> dict[str, Any] | None:
+    records = _target_state(state, target_name)["delegated_cli_recoveries"]
+    if not isinstance(records, dict):
+        raise StateCorruptionError(
+            "Guardian delegated CLI recovery records must be an object"
+        )
+    value = records.get(thread_id)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def save_delegated_cli_recovery(
+    state: MutableMapping[str, Any],
+    target_name: str,
+    thread_id: str,
+    record: MutableMapping[str, Any],
+    *,
+    now: int | None = None,
+) -> None:
+    records = _target_state(state, target_name)["delegated_cli_recoveries"]
+    if not isinstance(records, dict):
+        raise StateCorruptionError(
+            "Guardian delegated CLI recovery records must be an object"
+        )
+    records[thread_id] = {
+        **dict(record),
+        "recorded_at": int(time.time() if now is None else now),
+    }
+    if len(records) <= 64:
+        return
+    oldest = sorted(
+        (int(value.get("recorded_at", 0)), str(key))
+        for key, value in records.items()
+        if isinstance(value, dict)
+    )
+    for _, key in oldest[:-64]:
+        records.pop(key, None)
+
+
 def _prune_desktop_recovery_requests(
     requests: MutableMapping[str, Any], *, completed_limit: int = 32
 ) -> None:
@@ -447,4 +489,43 @@ class StateStore:
                 try:
                     yield
                 finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def singleton_supervisor(path: str | Path) -> Iterator[bool]:
+    """Try to hold one runtime-wide supervisor lease without waiting."""
+    lock_path = Path(path).expanduser().with_name(
+        Path(path).expanduser().name + ".supervisor.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        acquired = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except (BlockingIOError, OSError):
+            acquired = False
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
